@@ -7,17 +7,14 @@ class Fighter:
     """One combatant in a Battle. Pure data + small helpers — no Discord code here."""
 
     name: str
-    side: str          # "A" or "B" — which team they're on
+    side: str
     hp: int = 100
     max_hp: int = 100
     sp: int = 15
     speed: int = 10
     skill_slots: int = 3
 
-    # Every skill this fighter knows, keyed by lowercase name for easy lookup.
     skills: dict[str, Skill] = field(default_factory=dict)
-
-    # Filled in during the Declare Phase, cleared at the start of each round.
     declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
 
@@ -76,7 +73,6 @@ class Battle:
         return [f for f in self.fighters if f.side == side]
 
     def all_declared(self) -> bool:
-        """True once every living fighter has locked in a skill for this round."""
         return all(
             f.declared_skill is not None
             for f in self.fighters
