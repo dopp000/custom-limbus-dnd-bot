@@ -32,8 +32,12 @@ class SkillResult:
     def total_damage(self) -> int:
         return sum(c.damage_dealt for c in self.coin_results)
 
+    @property
+    def final_power(self) -> int:
+        """The Power reached after the last coin — this is what Clashes compare."""
+        return self.coin_results[-1].power_after
+
     def log(self) -> str:
-        """A human-readable breakdown, useful for both testing and Discord output later."""
         lines = [f"**{self.skill.name}** (Base {self.skill.base_power}, +{self.skill.coin_power} Coin Power, {self.skill.coins} coins)"]
         for i, c in enumerate(self.coin_results, start=1):
             face = "Heads" if c.heads else "Tails"
@@ -49,12 +53,6 @@ def flip_coin() -> bool:
 
 
 def resolve_skill(skill: Skill) -> SkillResult:
-    """Resolves a skill's coins one at a time, in sequence.
-
-    Every coin lands a hit at whatever Power has been built up so far.
-    A Heads permanently raises Power (by coin_power) for every hit after it,
-    including its own. A Tails deals a hit too, just without raising Power.
-    """
     power = skill.base_power
     results: list[CoinResult] = []
 
@@ -65,3 +63,13 @@ def resolve_skill(skill: Skill) -> SkillResult:
         results.append(CoinResult(heads=heads, power_after=power, damage_dealt=power))
 
     return SkillResult(skill=skill, coin_results=results)
+
+
+def resolve_clash(result_a: SkillResult, result_b: SkillResult) -> SkillResult | None:
+    """Compares two SkillResults by final_power. Returns the winner, or None on a tie."""
+    if result_a.final_power > result_b.final_power:
+        return result_a
+    elif result_b.final_power > result_a.final_power:
+        return result_b
+    else:
+        return None
