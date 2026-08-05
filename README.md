@@ -8,10 +8,10 @@ custom ruleset in `limbus-mha-combat-foundation.md`.
 ```
 .
 ├── main.py           # Bot entry point; loads cogs, starts the connection
-├── cogs/              # Discord-facing commands, grouped by feature (Lesson 2+)
+├── cogs/              # Discord-facing commands, grouped by feature
 ├── game/              # Game logic; battle state, coin resolution, status effects
 │
-├── data/              # Any persistent storage (Lesson 6+)
+├── data/              # Any persistent storage
 ├── requirements.txt
 ├── .env.example        # Template
 └── .gitignore
