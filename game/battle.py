@@ -4,7 +4,7 @@ from game.skills import Skill
 
 @dataclass
 class Fighter:
-    """One combatant in a Battle. Pure data + small helpers — no Discord code here."""
+    """One combatant in a Battle. Pure data plus small helpers, no Discord code here."""
 
     name: str
     side: str
@@ -17,6 +17,15 @@ class Fighter:
     skills: dict[str, Skill] = field(default_factory=dict)
     declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
+
+    # Temporary: tracks a single "primary" status name, only for picking the
+    # embed border color right now. The real Count/Potency status engine
+    # replaces this later, this is just a stand-in so we have something
+    # real to test the visual layer against.
+    active_status: str | None = None
+
+    def set_status(self, status_name: str | None):
+        self.active_status = status_name
 
     def is_alive(self) -> bool:
         return self.hp > 0
@@ -73,6 +82,7 @@ class Battle:
         return [f for f in self.fighters if f.side == side]
 
     def all_declared(self) -> bool:
+        """True once every living fighter has locked in a skill for this round."""
         return all(
             f.declared_skill is not None
             for f in self.fighters
@@ -85,10 +95,10 @@ class Battle:
             f.clear_declaration()
 
     def summary(self) -> str:
-        lines = [f"**Round {self.round_number}**"]
+        lines = [f"Round {self.round_number}"]
         for side_name in ("A", "B"):
-            lines.append(f"\n__Side {side_name}__")
+            lines.append(f"\nSide {side_name}")
             for f in self.side(side_name):
-                status = "💀" if not f.is_alive() else str(f)
+                status = "Down" if not f.is_alive() else str(f)
                 lines.append(f"- {status}")
         return "\n".join(lines)

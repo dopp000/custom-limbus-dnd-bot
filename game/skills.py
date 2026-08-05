@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Skill:
-    """A single skill definition — just the numbers, no Discord code."""
+    """A single skill definition."""
 
     name: str
     base_power: int
@@ -23,7 +23,7 @@ class CoinResult:
 
 @dataclass
 class SkillResult:
-    """The full outcome of resolving one skill — every coin, plus the total."""
+    """The full outcome of resolving one skill. Every coin, plus the total."""
 
     skill: Skill
     coin_results: list[CoinResult]
@@ -34,15 +34,16 @@ class SkillResult:
 
     @property
     def final_power(self) -> int:
-        """The Power reached after the last coin — this is what Clashes compare."""
+        """The Power reached after the last coin. This is what Clashes compare."""
         return self.coin_results[-1].power_after
 
     def log(self) -> str:
-        lines = [f"**{self.skill.name}** (Base {self.skill.base_power}, +{self.skill.coin_power} Coin Power, {self.skill.coins} coins)"]
+        """A human-readable breakdown for both testing and Discord output."""
+        lines = [f"{self.skill.name} (Base {self.skill.base_power}, +{self.skill.coin_power} Coin Power, {self.skill.coins} coins)"]
         for i, c in enumerate(self.coin_results, start=1):
             face = "Heads" if c.heads else "Tails"
-            lines.append(f"  Coin {i}: {face} → Power {c.power_after} → {c.damage_dealt} damage")
-        lines.append(f"  **Total: {self.total_damage} damage**")
+            lines.append(f"  Coin {i}: {face}, Power {c.power_after}, {c.damage_dealt} damage")
+        lines.append(f"  Total: {self.total_damage} damage")
         return "\n".join(lines)
 
 
@@ -53,6 +54,12 @@ def flip_coin() -> bool:
 
 
 def resolve_skill(skill: Skill) -> SkillResult:
+    """Resolves a skill's coins one at a time, in sequence.
+
+    Every coin lands a hit at whatever Power has been built up so far.
+    A Heads permanently raises Power (by coin_power) for every hit after it,
+    including its own. A Tails deals a hit too, just without raising Power.
+    """
     power = skill.base_power
     results: list[CoinResult] = []
 
@@ -66,7 +73,12 @@ def resolve_skill(skill: Skill) -> SkillResult:
 
 
 def resolve_clash(result_a: SkillResult, result_b: SkillResult) -> SkillResult | None:
-    """Compares two SkillResults by final_power. Returns the winner, or None on a tie."""
+    """Compares two SkillResults by final_power.
+
+    Returns the winning SkillResult (whose total_damage should be applied to
+    the loser), or None on a tie. You decide how ties get handled at the
+    call site, since that is a rules decision, not a math one.
+    """
     if result_a.final_power > result_b.final_power:
         return result_a
     elif result_b.final_power > result_a.final_power:

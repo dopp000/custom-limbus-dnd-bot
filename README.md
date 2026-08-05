@@ -1,4 +1,4 @@
-# MHA × Limbus Battle Bot
+# Limbattle Bot
 
 A Discord bot for running Limbus Company–style coin-flip combat, built around the
 custom ruleset in `limbus-mha-combat-foundation.md`.
@@ -7,13 +7,13 @@ custom ruleset in `limbus-mha-combat-foundation.md`.
 
 ```
 .
-├── main.py           # Bot entry point — loads cogs, starts the connection
-├── cogs/              # Discord-facing commands, grouped by feature (Lesson 2+)
-├── game/              # Pure game logic — battle state, coin resolution, status effects
-│                       #   (kept separate from Discord code so it can be tested on its own)
-├── data/              # Any persistent storage (Lesson 6+)
+├── main.py           # Bot entry point, loads cogs, starts the connection
+├── cogs/              # Discord-facing commands, grouped by feature
+├── game/              # Game logic; battle state, coin resolution, status effects
+│
+├── data/              # Any persistent storage
 ├── requirements.txt
-├── .env.example        # Template — copy to .env and fill in your real token
+├── .env.example        # Template
 └── .gitignore
 ```
 
@@ -41,12 +41,3 @@ custom ruleset in `limbus-mha-combat-foundation.md`.
    ```bash
    python main.py
    ```
-
-## Roadmap
-
-- [x] Lesson 1 — bot connects, responds to `/ping`
-- [ ] Lesson 2 — Cogs + `Battle` data class
-- [ ] Lesson 3 — admin commands (`/battle create`, add fighters)
-- [ ] Lesson 4 — declare phase + sequential coin resolution
-- [ ] Lesson 5 — status effects & SP economy
-- [ ] Lesson 6 — embeds, buttons, persistence
