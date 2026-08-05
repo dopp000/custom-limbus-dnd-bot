@@ -1,22 +1,24 @@
 from dataclasses import dataclass, field
+from game.skills import Skill
 
 
 @dataclass
 class Fighter:
-    """test."""
+    """One combatant in a Battle. Pure data + small helpers — no Discord code here."""
 
     name: str
-    side: str          # "A" or "B" which team they're on
+    side: str          # "A" or "B" — which team they're on
     hp: int = 100
     max_hp: int = 100
     sp: int = 15
     speed: int = 10
     skill_slots: int = 3
 
+    # Every skill this fighter knows, keyed by lowercase name for easy lookup.
+    skills: dict[str, Skill] = field(default_factory=dict)
+
     # Filled in during the Declare Phase, cleared at the start of each round.
-    # We'll build the actual skill-declaring command in the next lesson —
-    # for now this just holds a plain string as a placeholder.
-    declared_action: str | None = None
+    declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
 
     def is_alive(self) -> bool:
@@ -29,14 +31,23 @@ class Fighter:
         self.sp += amount
 
     def spend_sp(self, amount: int) -> bool:
-        """Returns False (and spends nothing) if the fighter can't afford it."""
         if self.sp < amount:
             return False
         self.sp -= amount
         return True
 
+    def add_skill(self, skill: Skill):
+        self.skills[skill.name.lower()] = skill
+
+    def get_skill(self, name: str) -> Skill | None:
+        return self.skills.get(name.lower())
+
+    def declare(self, skill: Skill, target: "Fighter") -> None:
+        self.declared_skill = skill
+        self.declared_target = target
+
     def clear_declaration(self):
-        self.declared_action = None
+        self.declared_skill = None
         self.declared_target = None
 
     def __str__(self):
@@ -45,7 +56,7 @@ class Fighter:
 
 @dataclass
 class Battle:
-    """One active fight scoped to a single channel."""
+    """One active fight, scoped to a single Discord channel."""
 
     channel_id: int
     fighters: list[Fighter] = field(default_factory=list)
@@ -65,9 +76,9 @@ class Battle:
         return [f for f in self.fighters if f.side == side]
 
     def all_declared(self) -> bool:
-        """True once every living fighter has locked in an action for this round."""
+        """True once every living fighter has locked in a skill for this round."""
         return all(
-            f.declared_action is not None
+            f.declared_skill is not None
             for f in self.fighters
             if f.is_alive()
         )
@@ -82,6 +93,6 @@ class Battle:
         for side_name in ("A", "B"):
             lines.append(f"\n__Side {side_name}__")
             for f in self.side(side_name):
-                status = "Dead" if not f.is_alive() else str(f)
+                status = "💀" if not f.is_alive() else str(f)
                 lines.append(f"- {status}")
         return "\n".join(lines)
