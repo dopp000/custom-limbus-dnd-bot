@@ -15,8 +15,8 @@ bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 # List every cog file here (without .py). As we add more, this list grows.
 INITIAL_COGS = [
     "cogs.general",
+    "cogs.battle",
 ]
-
 
 @bot.event
 async def on_ready():
