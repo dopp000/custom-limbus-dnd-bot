@@ -1,7 +1,7 @@
 # Limbattle Bot
 
 A Discord bot for running Limbus Company–style coin-flip combat, built around the
-custom ruleset in `limbus-mha-combat-foundation.md`.
+custom ruleset.
 
 ## Project Structure
 
