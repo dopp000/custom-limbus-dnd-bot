@@ -16,7 +16,10 @@ bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 INITIAL_COGS = [
     "cogs.general",
     "cogs.battle",
+    "cogs.character",
+    "cogs.roll",
 ]
+
 
 @bot.event
 async def on_ready():

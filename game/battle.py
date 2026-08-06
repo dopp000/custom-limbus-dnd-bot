@@ -12,7 +12,9 @@ class Fighter:
     max_hp: int = 100
     sp: int = 15
     speed: int = 10
+    power: int = 6
     skill_slots: int = 3
+    avatar_url: str | None = None
 
     skills: dict[str, Skill] = field(default_factory=dict)
     declared_skill: Skill | None = None
@@ -23,6 +25,26 @@ class Fighter:
     # replaces this later, this is just a stand-in so we have something
     # real to test the visual layer against.
     active_status: str | None = None
+
+    @classmethod
+    def from_character(cls, character, side: str) -> "Fighter":
+        """Builds a Fighter pre-filled with a saved Character's stats and avatar.
+
+        Accepts anything with .name/.hp/.max_hp/.sp/.speed/.power/.avatar_url
+        (a game.character.Character, in practice). Deliberately not importing
+        Character here, since Python does not enforce type hints at runtime,
+        this keeps game/battle.py from needing to know game/character.py exists.
+        """
+        return cls(
+            name=character.name,
+            side=side,
+            hp=character.hp,
+            max_hp=character.max_hp,
+            sp=character.sp,
+            speed=character.speed,
+            power=character.power,
+            avatar_url=character.avatar_url,
+        )
 
     def set_status(self, status_name: str | None):
         self.active_status = status_name
@@ -95,9 +117,9 @@ class Battle:
             f.clear_declaration()
 
     def summary(self) -> str:
-        lines = [f"Round {self.round_number}"]
+        lines = [f"**Round {self.round_number}**"]
         for side_name in ("A", "B"):
-            lines.append(f"\nSide {side_name}")
+            lines.append(f"\n__Side {side_name}__")
             for f in self.side(side_name):
                 status = "Down" if not f.is_alive() else str(f)
                 lines.append(f"- {status}")

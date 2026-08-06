@@ -5,16 +5,25 @@ from discord import app_commands
 from game.battle import Battle, Fighter
 from game.skills import Skill, resolve_skill, resolve_clash
 from game.colors import get_status_color
+from game.character import load_character
 
 
 def build_fighter_embed(fighter: Fighter) -> discord.Embed:
-    """Colored left border keyed to the fighter's active
-    status, name as the title, core stats as fields.
+    """One embed per fighter, so each one's own avatar actually shows.
+
+    Discord embeds only support a single image/thumbnail each, and embeds
+    in one message always stack vertically, never side by side, so a
+    merged "one card per side" view can only ever show one avatar. This
+    keeps individual avatars correct, ordered so same-side fighters sit
+    next to each other in the stack instead.
     """
     embed = discord.Embed(
         title=fighter.name,
         color=get_status_color(fighter.active_status),
     )
+    if fighter.avatar_url:
+        embed.set_thumbnail(url=fighter.avatar_url)
+    embed.add_field(name="Side", value=fighter.side, inline=True)
     embed.add_field(name="HP", value=f"{fighter.hp}/{fighter.max_hp}", inline=True)
     embed.add_field(name="SP", value=str(fighter.sp), inline=True)
     embed.add_field(name="Speed", value=str(fighter.speed), inline=True)
@@ -49,15 +58,17 @@ class BattleCog(commands.GroupCog, name="battle"):
 
     @app_commands.command(name="addfighter", description="Add a fighter to the current battle")
     @app_commands.describe(
-        name="Fighter's name",
         side="A or B",
-        hp="Starting HP (optional, default 100)",
+        character_name="Pull stats and avatar from a saved character (optional)",
+        name="Fighter's name, only used if not pulling from a saved character",
+        hp="Starting HP, only used if not pulling from a saved character (default 100)",
     )
     async def addfighter(
         self,
         interaction: discord.Interaction,
-        name: str,
         side: str,
+        character_name: str | None = None,
+        name: str | None = None,
         hp: int = 100,
     ):
         battle = self.battles.get(interaction.channel_id)
@@ -70,6 +81,43 @@ class BattleCog(commands.GroupCog, name="battle"):
         side = side.upper()
         if side not in ("A", "B"):
             await interaction.response.send_message("Side must be A or B.", ephemeral=True)
+            return
+
+        if character_name is None and name is None:
+            await interaction.response.send_message(
+                "Provide either character_name (a saved character) or name (a one-off fighter).",
+                ephemeral=True,
+            )
+            return
+
+        if character_name is not None and name is not None:
+            await interaction.response.send_message(
+                "Use character_name OR name, not both. character_name pulls a saved character, "
+                "name creates a one-off fighter for just this battle.",
+                ephemeral=True,
+            )
+            return
+
+        if character_name is not None:
+            character = load_character(character_name)
+            if character is None:
+                await interaction.response.send_message(
+                    f"No character named {character_name}.", ephemeral=True
+                )
+                return
+
+            if battle.get_fighter(character.name) is not None:
+                await interaction.response.send_message(
+                    f"A fighter named {character.name} already exists in this battle.", ephemeral=True
+                )
+                return
+
+            fighter = Fighter.from_character(character, side)
+            battle.add_fighter(fighter)
+            await interaction.response.send_message(
+                f"Added {fighter.name} to Side {side}, pulled from saved character "
+                f"(HP {fighter.hp}, SP {fighter.sp}, Speed {fighter.speed}, Power {fighter.power})."
+            )
             return
 
         if battle.get_fighter(name) is not None:
@@ -91,7 +139,10 @@ class BattleCog(commands.GroupCog, name="battle"):
         if not battle.fighters:
             await interaction.response.send_message("No fighters in this battle yet.", ephemeral=True)
             return
-        embeds = [build_fighter_embed(f) for f in battle.fighters]
+        # Order by side so Side A fighters stack together, then Side B,
+        # even though each is its own embed card.
+        ordered = sorted(battle.fighters, key=lambda f: f.side)
+        embeds = [build_fighter_embed(f) for f in ordered]
         await interaction.response.send_message(embeds=embeds)
 
     @app_commands.command(name="setstatus", description="Manually set a fighter's active status (testing only)")
