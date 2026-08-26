@@ -48,15 +48,6 @@ def build_character_embed(character: Character, owner_name: str) -> discord.Embe
     embed.set_footer(text=f"Owner: {owner_name}")
     return embed
 
-    resist_lines = []
-    for k, v in character.resistances.items():
-        icon = damage_type_emoji(k) if k in DAMAGE_TYPES else status_emoji(k)
-        resist_lines.append(f"{icon} {k.capitalize()}: {v}%")
-    embed.add_field(name="Resistances", value="\n".join(resist_lines), inline=False)
-
-    embed.set_footer(text=f"Owner: {owner_name}")
-    return embed
-
 
 def is_admin(interaction: discord.Interaction) -> bool:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -204,10 +195,6 @@ class CharacterCog(commands.GroupCog, name="character"):
             character.hp = hp
             character.max_hp = hp
             changes.append(f"HP -> {hp}")
-
-        if sp is not None:
-            character.sp = sp
-            changes.append(f"SP -> {sp}")
 
         if speed is not None:
             character.speed = speed
