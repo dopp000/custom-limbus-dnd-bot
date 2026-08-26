@@ -2,7 +2,10 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-from game.battle import Battle, Fighter
+from game.battle import (
+    Battle, Fighter,
+    SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
+)
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash
 from game.colors import get_status_color
 from game.character import load_character
@@ -125,7 +128,7 @@ def build_fighter_embed(fighter: Fighter) -> discord.Embed:
         embed.set_thumbnail(url=fighter.avatar_url)
     embed.add_field(name="Side", value=fighter.side, inline=True)
     embed.add_field(name="HP", value=f"{fighter.hp}/{fighter.max_hp}", inline=True)
-    embed.add_field(name="SP", value=str(fighter.sp), inline=True)
+    embed.add_field(name="Sanity", value=str(fighter.sanity), inline=True)
     embed.add_field(name="Speed", value=str(fighter.speed), inline=True)
     if fighter.statuses:
         lines = [
@@ -507,9 +510,16 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
 
             if is_clash:
-                outcome = resolve_round_clash(fighter.declared_skill, target.declared_skill)
+                outcome = resolve_round_clash(
+                    fighter.declared_skill, target.declared_skill,
+                    heads_chance_a=fighter.heads_chance(),
+                    heads_chance_b=target.heads_chance(),
+                )
                 winner = fighter if outcome.winner == "a" else target
                 loser = target if winner is fighter else fighter
+
+                winner.gain_sanity(SANITY_CLASH_WIN)
+                loser.lose_sanity(SANITY_CLASH_LOSS)
 
                 total_damage, status_log = apply_incoming_hit(
                     winner.declared_skill, outcome.total_damage(), loser
@@ -526,6 +536,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"\n\n**{winner.name} wins the clash.** {loser.name} takes {total_damage} damage. "
                     f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
                 )
+                field_value += (
+                    f"\n{winner.name} Sanity +{SANITY_CLASH_WIN} ({winner.sanity}), "
+                    f"{loser.name} Sanity -{SANITY_CLASH_LOSS} ({loser.sanity})"
+                )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
 
@@ -538,7 +552,11 @@ class BattleCog(commands.GroupCog, name="battle"):
                 already_resolved.add(target.name)
 
             else:
-                result = resolve_skill(fighter.declared_skill)
+                result = resolve_skill(fighter.declared_skill, fighter.heads_chance())
+                heads_landed = sum(1 for c in result.coin_results if c.heads)
+                sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
+                fighter.gain_sanity(sanity_gain)
+
                 total_damage, status_log = apply_incoming_hit(
                     fighter.declared_skill, result.total_damage, target
                 )
@@ -549,6 +567,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"\n\n{target.name} takes {total_damage} damage. "
                     f"({target.name}: {target.hp}/{target.max_hp} HP)"
                 )
+                field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
 

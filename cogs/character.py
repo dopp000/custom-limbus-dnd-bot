@@ -36,9 +36,17 @@ def build_character_embed(character: Character, owner_name: str) -> discord.Embe
     if character.avatar_url:
         embed.set_thumbnail(url=character.avatar_url)
     embed.add_field(name="HP", value=f"{character.hp}/{character.max_hp}", inline=True)
-    embed.add_field(name="SP", value=str(character.sp), inline=True)
     embed.add_field(name="Speed", value=str(character.speed), inline=True)
     embed.add_field(name="Power", value=str(character.power), inline=True)
+
+    resist_lines = []
+    for k, v in character.resistances.items():
+        icon = damage_type_emoji(k) if k in DAMAGE_TYPES else status_emoji(k)
+        resist_lines.append(f"{icon} {k.capitalize()}: {v}%")
+    embed.add_field(name="Resistances", value="\n".join(resist_lines), inline=False)
+
+    embed.set_footer(text=f"Owner: {owner_name}")
+    return embed
 
     resist_lines = []
     for k, v in character.resistances.items():
@@ -151,7 +159,6 @@ class CharacterCog(commands.GroupCog, name="character"):
         new_name="Rename the character (optional)",
         avatar="New avatar image (optional)",
         hp="New max HP, also heals to full (optional)",
-        sp="New SP (optional)",
         speed="New Speed (optional)",
         power="New Power (optional)",
     )
@@ -162,7 +169,6 @@ class CharacterCog(commands.GroupCog, name="character"):
         new_name: str | None = None,
         avatar: discord.Attachment | None = None,
         hp: int | None = None,
-        sp: int | None = None,
         speed: int | None = None,
         power: int | None = None,
     ):

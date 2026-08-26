@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
@@ -11,6 +12,10 @@ CHARACTERS_DIR = "data/characters"
 class Character:
     """A persistent, player-built character. Survives bot restarts, unlike
     a Battle's Fighter objects, which only exist for one fight.
+
+    Note: no SP/Sanity field here. Sanity is a per-battle resource that
+    always starts at 0 regardless of what the character did in past
+    battles, so it lives on Fighter (game/battle.py), not here.
     """
 
     owner_id: int  # Discord user ID of whoever created this character
@@ -18,7 +23,6 @@ class Character:
     avatar_url: str | None = None
     hp: int = 100
     max_hp: int = 100
-    sp: int = 15
     speed: int = 10
     power: int = 6
     resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
@@ -30,7 +34,6 @@ class Character:
             "avatar_url": self.avatar_url,
             "hp": self.hp,
             "max_hp": self.max_hp,
-            "sp": self.sp,
             "speed": self.speed,
             "power": self.power,
             "resistances": self.resistances,
@@ -45,6 +48,14 @@ class Character:
         resistances = dict(DEFAULT_RESISTANCES)
         resistances.update(data.get("resistances", {}))
         data["resistances"] = resistances
+
+        # Forward-compatible: drop any keys that no longer exist as real
+        # fields (e.g. old saves still carrying "sp" from before the
+        # Sanity merge), so old character files load instead of crashing
+        # with an unexpected-keyword-argument error.
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
+
         return cls(**data)
 
 

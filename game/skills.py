@@ -54,24 +54,31 @@ class SkillResult:
         return "\n".join(lines)
 
 
-def flip_coin() -> bool:
-    """Rolls a d20. 11-20 is Heads, 1-10 is Tails. Returns True for Heads."""
-    roll = random.randint(1, 20)
-    return roll >= 11
+def flip_coin(heads_chance: int = 50) -> bool:
+    """Rolls a percentage-based coin flip. heads_chance is 0-100, the
+    percent chance of landing Heads. Defaults to a fair 50/50 so every
+    existing caller that doesn't pass this stays behaves exactly as
+    before.
+    """
+    roll = random.randint(1, 100)
+    return roll <= heads_chance
 
 
-def resolve_skill(skill: Skill) -> SkillResult:
+def resolve_skill(skill: Skill, heads_chance: int = 50) -> SkillResult:
     """Resolves a skill's coins one at a time, in sequence.
 
     Every coin lands a hit at whatever Power has been built up so far.
     A Heads permanently raises Power (by coin_power) for every hit after it,
     including its own. A Tails deals a hit too, just without raising Power.
+
+    heads_chance is this skill's OWN caster's Sanity-driven odds (see
+    Fighter.heads_chance in game/battle.py), defaulting to a fair 50/50.
     """
     power = skill.base_power
     results: list[CoinResult] = []
 
     for _ in range(skill.coins):
-        heads = flip_coin()
+        heads = flip_coin(heads_chance)
         if heads:
             power += skill.coin_power
         results.append(CoinResult(heads=heads, power_after=power, damage_dealt=power))
@@ -200,7 +207,13 @@ class ClashOutcome:
         return self.winner_final_result.total_damage
 
 
-def resolve_round_clash(skill_a: Skill, skill_b: Skill, max_rounds: int = 100) -> ClashOutcome:
+def resolve_round_clash(
+    skill_a: Skill,
+    skill_b: Skill,
+    heads_chance_a: int = 50,
+    heads_chance_b: int = 50,
+    max_rounds: int = 100,
+) -> ClashOutcome:
     """Resolves a clash via round-by-round coin attrition.
 
     Each round, both sides toss ALL of their currently-remaining coins
@@ -216,6 +229,10 @@ def resolve_round_clash(skill_a: Skill, skill_b: Skill, max_rounds: int = 100) -
     exactly like an unopposed attack, and that toss is what actually
     deals damage. The attrition rounds themselves never deal damage,
     they only decide who wins and how many coins the winner has left.
+
+    heads_chance_a/heads_chance_b are each side's OWN Sanity-driven odds
+    (Fighter.heads_chance()), applied to every toss on that side, both
+    during attrition and on the final damage toss.
 
     max_rounds is a safety valve against a true infinite loop (a tie
     every single round forever); hitting it is astronomically unlikely
@@ -237,8 +254,8 @@ def resolve_round_clash(skill_a: Skill, skill_b: Skill, max_rounds: int = 100) -
         before_a, before_b = coins_a, coins_b
         temp_a = replace(skill_a, coins=coins_a)
         temp_b = replace(skill_b, coins=coins_b)
-        result_a = resolve_skill(temp_a)
-        result_b = resolve_skill(temp_b)
+        result_a = resolve_skill(temp_a, heads_chance_a)
+        result_b = resolve_skill(temp_b, heads_chance_b)
 
         if result_a.final_power > result_b.final_power:
             loser = "b"
@@ -258,8 +275,9 @@ def resolve_round_clash(skill_a: Skill, skill_b: Skill, max_rounds: int = 100) -
     winner = "a" if coins_a > 0 else "b"
     winner_skill = skill_a if winner == "a" else skill_b
     winner_remaining = coins_a if winner == "a" else coins_b
+    winner_heads_chance = heads_chance_a if winner == "a" else heads_chance_b
 
     final_skill = replace(winner_skill, coins=winner_remaining)
-    final_result = resolve_skill(final_skill)
+    final_result = resolve_skill(final_skill, winner_heads_chance)
 
     return ClashOutcome(winner=winner, rounds=rounds, winner_final_result=final_result)

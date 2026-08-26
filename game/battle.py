@@ -3,6 +3,19 @@ from game.skills import Skill
 from game.statuses import StatusInstance
 from game.resistances import DEFAULT_RESISTANCES
 
+# Sanity is the per-battle resource that biases a fighter's own coin
+# flips. Always starts at 0 each battle (never carried over from a
+# Character), clamped to this range.
+SANITY_MIN = -45
+SANITY_MAX = 45
+
+# Sanity economy constants, all tunable.
+SANITY_CLASH_WIN = 5
+SANITY_CLASH_LOSS = 5
+SANITY_PER_HEADS_UNOPPOSED = 1
+SANITY_DRIFT_POSITIVE = 4   # positive Sanity drains toward 0 by up to this much each turn
+SANITY_DRIFT_NEGATIVE = 2   # negative Sanity recovers toward 0 by up to this much each turn (slower)
+
 
 @dataclass
 class Fighter:
@@ -12,7 +25,7 @@ class Fighter:
     side: str
     hp: int = 100
     max_hp: int = 100
-    sp: int = 15
+    sanity: int = 0
     speed: int = 10
     power: int = 6
     skill_slots: int = 3
@@ -23,14 +36,15 @@ class Fighter:
     declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
 
-    # Real status engine now, keyed by status name. Replaces the earlier
-    # placeholder single active_status string.
+    # Real status engine, keyed by status name.
     statuses: dict[str, StatusInstance] = field(default_factory=dict)
 
     @classmethod
     def from_character(cls, character, side: str) -> "Fighter":
         """Builds a Fighter pre-filled with a saved Character's stats,
-        avatar, and resistances.
+        avatar, and resistances. Sanity is NOT pulled from the character,
+        it always starts at 0 (the dataclass default) at the start of
+        every battle regardless of past battles.
 
         Accepts anything with the right attributes (a game.character.Character,
         in practice). Deliberately not importing Character here, keeps
@@ -41,7 +55,6 @@ class Fighter:
             side=side,
             hp=character.hp,
             max_hp=character.max_hp,
-            sp=character.sp,
             speed=character.speed,
             power=character.power,
             avatar_url=character.avatar_url,
@@ -66,14 +79,28 @@ class Fighter:
     def take_damage(self, amount: int):
         self.hp = max(0, self.hp - amount)
 
-    def gain_sp(self, amount: int):
-        self.sp += amount
+    def gain_sanity(self, amount: int):
+        self.sanity = min(SANITY_MAX, self.sanity + amount)
 
-    def spend_sp(self, amount: int) -> bool:
-        if self.sp < amount:
-            return False
-        self.sp -= amount
-        return True
+    def lose_sanity(self, amount: int):
+        self.sanity = max(SANITY_MIN, self.sanity - amount)
+
+    def heads_chance(self) -> int:
+        """Percent chance this fighter's own coins land Heads, driven by
+        Sanity. 50 baseline, shifted by Sanity. Since Sanity is always
+        clamped to [-45, 45], this naturally stays within [5, 95].
+        """
+        return 50 + self.sanity
+
+    def apply_sanity_drift(self):
+        """Called at the end of a round (start_new_round). Positive
+        Sanity drains toward 0, negative Sanity recovers toward 0, at
+        different rates, and neither ever crosses past 0.
+        """
+        if self.sanity > 0:
+            self.sanity = max(0, self.sanity - SANITY_DRIFT_POSITIVE)
+        elif self.sanity < 0:
+            self.sanity = min(0, self.sanity + SANITY_DRIFT_NEGATIVE)
 
     def add_skill(self, skill: Skill):
         self.skills[skill.name.lower()] = skill
@@ -90,7 +117,7 @@ class Fighter:
         self.declared_target = None
 
     def __str__(self):
-        return f"{self.name} (HP {self.hp}/{self.max_hp}, SP {self.sp}, Speed {self.speed})"
+        return f"{self.name} (HP {self.hp}/{self.max_hp}, Sanity {self.sanity}, Speed {self.speed})"
 
 
 @dataclass
@@ -126,6 +153,7 @@ class Battle:
         self.round_number += 1
         for f in self.fighters:
             f.clear_declaration()
+            f.apply_sanity_drift()
 
     def summary(self) -> str:
         lines = [f"**Round {self.round_number}**"]
