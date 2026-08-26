@@ -3,24 +3,26 @@ from game.skills import Skill
 from game.statuses import StatusInstance
 from game.resistances import DEFAULT_RESISTANCES
 
-# Sanity is the per-battle resource that biases a fighter's own coin
-# flips. Always starts at 0 each battle (never carried over from a
-# Character), clamped to this range.
 SANITY_MIN = -45
 SANITY_MAX = 45
 
-# Sanity economy constants, all tunable.
 SANITY_CLASH_WIN = 5
 SANITY_CLASH_LOSS = 5
 SANITY_PER_HEADS_UNOPPOSED = 1
-SANITY_DRIFT_POSITIVE = 4   # positive Sanity drains toward 0 by up to this much each turn
-SANITY_DRIFT_NEGATIVE = 2   # negative Sanity recovers toward 0 by up to this much each turn (slower)
+SANITY_DRIFT_POSITIVE = 4
+SANITY_DRIFT_NEGATIVE = 2
+
+# Battle type -> display title + embed color. Spar is casual, Standard is
+# a normal encounter, Fatal is a real stakes fight (Limbus naming).
+BATTLE_TYPES = {
+    "spar": {"title": "Spar", "color": 0x57F287},               # green
+    "standard": {"title": "Proelium Commune", "color": 0xFEE75C},  # yellow
+    "fatal": {"title": "Proelium Fatale", "color": 0xED4245},      # red
+}
 
 
 @dataclass
 class Fighter:
-    """One combatant in a Battle. Pure data plus small helpers, no Discord code here."""
-
     name: str
     side: str
     hp: int = 100
@@ -36,20 +38,10 @@ class Fighter:
     declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
 
-    # Real status engine, keyed by status name.
     statuses: dict[str, StatusInstance] = field(default_factory=dict)
 
     @classmethod
     def from_character(cls, character, side: str) -> "Fighter":
-        """Builds a Fighter pre-filled with a saved Character's stats,
-        avatar, and resistances. Sanity is NOT pulled from the character,
-        it always starts at 0 (the dataclass default) at the start of
-        every battle regardless of past battles.
-
-        Accepts anything with the right attributes (a game.character.Character,
-        in practice). Deliberately not importing Character here, keeps
-        game/battle.py from needing to know game/character.py exists.
-        """
         return cls(
             name=character.name,
             side=side,
@@ -65,9 +57,6 @@ class Fighter:
         return self.statuses.get(name)
 
     def set_status_instance(self, instance: StatusInstance):
-        """Stores a status instance, or removes it entirely if its Count
-        has reached 0 (no point keeping an empty, expired entry around).
-        """
         if instance.count <= 0:
             self.statuses.pop(instance.name, None)
         else:
@@ -86,17 +75,9 @@ class Fighter:
         self.sanity = max(SANITY_MIN, self.sanity - amount)
 
     def heads_chance(self) -> int:
-        """Percent chance this fighter's own coins land Heads, driven by
-        Sanity. 50 baseline, shifted by Sanity. Since Sanity is always
-        clamped to [-45, 45], this naturally stays within [5, 95].
-        """
         return 50 + self.sanity
 
     def apply_sanity_drift(self):
-        """Called at the end of a round (start_new_round). Positive
-        Sanity drains toward 0, negative Sanity recovers toward 0, at
-        different rates, and neither ever crosses past 0.
-        """
         if self.sanity > 0:
             self.sanity = max(0, self.sanity - SANITY_DRIFT_POSITIVE)
         elif self.sanity < 0:
@@ -128,6 +109,8 @@ class Battle:
     fighters: list[Fighter] = field(default_factory=list)
     round_number: int = 1
     started: bool = False
+    battle_type: str = "spar"  # "spar", "standard", or "fatal"
+    message_id: int | None = None  # the persistent battle-view post, edited in place
 
     def add_fighter(self, fighter: Fighter):
         self.fighters.append(fighter)
@@ -142,7 +125,6 @@ class Battle:
         return [f for f in self.fighters if f.side == side]
 
     def all_declared(self) -> bool:
-        """True once every living fighter has locked in a skill for this round."""
         return all(
             f.declared_skill is not None
             for f in self.fighters
