@@ -3,23 +3,123 @@ from discord.ext import commands
 from discord import app_commands
 
 from game.battle import Battle, Fighter
-from game.skills import Skill, resolve_skill, resolve_clash
+from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash
 from game.colors import get_status_color
 from game.character import load_character
+from game.statuses import StatusInstance, decay_after_trigger, apply_status, INFLICTABLE_STATUSES
+from game.resistances import DAMAGE_TYPES, apply_resistance
+from game.emojis import status_emoji, coin_emoji, damage_type_emoji
+
+LOG_CHANNEL_ID = 1538071557560213595  # #bot-combat-logs
+
+
+class SkillConfirmView(discord.ui.View):
+    """Confirm/Cancel buttons shown after /battle addskill, so a skill
+    only actually gets saved once the player explicitly confirms it (and
+    a typo or change of mind doesn't need an admin to undo).
+    """
+
+    def __init__(self, fighter: Fighter, skill: Skill, preview_text: str, timeout: float = 60):
+        super().__init__(timeout=timeout)
+        self.fighter = fighter
+        self.skill = skill
+        self.preview_text = preview_text
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.fighter.add_skill(self.skill)
+
+        log_channel = interaction.client.get_channel(LOG_CHANNEL_ID)
+        if log_channel is not None:
+            await log_channel.send(
+                f"{interaction.user.mention} confirmed a new skill for **{self.fighter.name}**:\n"
+                f"{self.preview_text}"
+            )
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"**Confirmed.** {self.fighter.name} learned {self.skill.name}.",
+            view=self,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Cancelled. No skill was added.",
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        # Nobody clicked within the timeout window. The skill was never
+        # added (that only happens inside confirm()), so there's nothing
+        # to undo, just let the buttons go stale silently.
+        for child in self.children:
+            child.disabled = True
+
+
+def format_skill_result(result: SkillResult, survived: list[bool] | None = None) -> str:
+    """Discord-facing version of SkillResult.log() (game/skills.py).
+    same coin-by-coin breakdown, but with real Heads/Tails emoji instead
+    of plain text. Kept separate from .log() on purpose: .log() stays
+    plain-text so it's still usable for quick REPL testing without any
+    Discord/emoji setup involved.
+
+    If `survived` is given (one bool per coin, from a pairwise clash),
+    destroyed coins are struck through and excluded from the total.
+    """
+    lines = [
+        f"**{result.skill.name}** (Base {result.skill.base_power}, "
+        f"+{result.skill.coin_power} Coin Power, {result.skill.coins} coins)"
+    ]
+    total = 0
+    for i, c in enumerate(result.coin_results, start=1):
+        face = coin_emoji("heads") if c.heads else coin_emoji("tails")
+        alive = survived[i - 1] if survived is not None else True
+        line = f"  Coin {i}: {face} Power {c.power_after}, {c.damage_dealt} damage"
+        if not alive:
+            line = f"~~{line.strip()}~~ (destroyed)"
+            lines.append(f"  {line}")
+        else:
+            lines.append(line)
+            total += c.damage_dealt
+    lines.append(f"  **Total: {total} damage**")
+    return "\n".join(lines)
+
+
+def format_clash_rounds(outcome: ClashOutcome, name_a: str, name_b: str) -> str:
+    """Compact one-line-per-round summary of the attrition phase: each
+    round's Power comparison and who lost a coin (or if it tied).
+    """
+    lines = []
+    for i, r in enumerate(outcome.rounds, start=1):
+        line = (
+            f"Round {i}: {name_a} ({r.coins_a_before} coins) Power {r.result_a.final_power} "
+            f"vs {name_b} ({r.coins_b_before} coins) Power {r.result_b.final_power}"
+        )
+        if r.loser == "a":
+            line += f" -> {name_a} loses a coin"
+        elif r.loser == "b":
+            line += f" -> {name_b} loses a coin"
+        else:
+            line += " -> tie, nobody loses a coin"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def build_fighter_embed(fighter: Fighter) -> discord.Embed:
-    """One embed per fighter, so each one's own avatar actually shows.
-
-    Discord embeds only support a single image/thumbnail each, and embeds
-    in one message always stack vertically, never side by side, so a
-    merged "one card per side" view can only ever show one avatar. This
-    keeps individual avatars correct, ordered so same-side fighters sit
-    next to each other in the stack instead.
+    """One embed per fighter. Border color keys off whichever status is
+    first in the dict (arbitrary if multiple are active, Discord only
+    allows one color per embed so there's no perfect answer here).
     """
+    primary_status = next(iter(fighter.statuses), None)
     embed = discord.Embed(
         title=fighter.name,
-        color=get_status_color(fighter.active_status),
+        color=get_status_color(primary_status),
     )
     if fighter.avatar_url:
         embed.set_thumbnail(url=fighter.avatar_url)
@@ -27,11 +127,70 @@ def build_fighter_embed(fighter: Fighter) -> discord.Embed:
     embed.add_field(name="HP", value=f"{fighter.hp}/{fighter.max_hp}", inline=True)
     embed.add_field(name="SP", value=str(fighter.sp), inline=True)
     embed.add_field(name="Speed", value=str(fighter.speed), inline=True)
-    if fighter.active_status:
-        embed.set_footer(text=f"Status: {fighter.active_status.capitalize()}")
+    if fighter.statuses:
+        lines = [
+            f"{status_emoji(s.name)} {s.name.capitalize()}: {s.potency}/{s.count}"
+            for s in fighter.statuses.values()
+        ]
+        embed.add_field(name="Statuses", value="\n".join(lines), inline=False)
     if not fighter.is_alive():
         embed.description = "Down"
     return embed
+
+
+def apply_incoming_hit(attacker_skill: Skill, raw_damage: int, target: Fighter) -> tuple[int, list[str]]:
+    """One fighter just landed a hit on another. This handles everything
+    that happens to the TARGET as a result:
+
+    1. The attacking skill's damage_type gets reduced by the target's
+       resistance for that type.
+    2. If the target currently has Rupture, it triggers: deals its stored
+       Potency as bonus damage, then decays (Count -1, or fully clears if
+       that was the last stack). Rupture is the only status with an
+       automatic on-hit trigger wired up so far.
+    3. If the attacking skill inflicts a NEW status, it layers on top
+       (after step 2's decay, if the status happens to be Rupture, so the
+       stacking rules from game/statuses.py apply correctly), with the
+       incoming Potency reduced by the target's resistance for that status.
+
+    Returns (total_damage_to_apply, log_lines_describing_what_happened).
+    """
+    log = []
+
+    resisted_damage = apply_resistance(raw_damage, target.resistances.get(attacker_skill.damage_type, 0))
+    total_damage = resisted_damage
+    if resisted_damage != raw_damage:
+        log.append(
+            f"({damage_type_emoji(attacker_skill.damage_type)} "
+            f"{attacker_skill.damage_type.capitalize()} resistance: {raw_damage} -> {resisted_damage})"
+        )
+
+    decayed_rupture = None
+    rupture = target.get_status("rupture")
+    if rupture is not None:
+        total_damage += rupture.potency
+        log.append(f"{status_emoji('rupture')} Rupture triggers on {target.name}: +{rupture.potency} damage")
+        decayed_rupture = decay_after_trigger(rupture)
+        target.set_status_instance(decayed_rupture)
+
+    if attacker_skill.status_name:
+        resistance_pct = target.resistances.get(attacker_skill.status_name, 0)
+        added_potency = apply_resistance(attacker_skill.status_potency, resistance_pct)
+        added_count = attacker_skill.status_count
+
+        if attacker_skill.status_name == "rupture":
+            current = decayed_rupture
+        else:
+            current = target.get_status(attacker_skill.status_name)
+
+        new_instance = apply_status(current, attacker_skill.status_name, added_potency, added_count)
+        target.set_status_instance(new_instance)
+        log.append(
+            f"{target.name} gains {status_emoji(attacker_skill.status_name)} "
+            f"{attacker_skill.status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
+        )
+
+    return total_damage, log
 
 
 class BattleCog(commands.GroupCog, name="battle"):
@@ -59,7 +218,7 @@ class BattleCog(commands.GroupCog, name="battle"):
     @app_commands.command(name="addfighter", description="Add a fighter to the current battle")
     @app_commands.describe(
         side="A or B",
-        character_name="Pull stats and avatar from a saved character (optional)",
+        character_name="Pull stats, avatar, and resistances from a saved character (optional)",
         name="Fighter's name, only used if not pulling from a saved character",
         hp="Starting HP, only used if not pulling from a saved character (default 100)",
     )
@@ -139,18 +298,29 @@ class BattleCog(commands.GroupCog, name="battle"):
         if not battle.fighters:
             await interaction.response.send_message("No fighters in this battle yet.", ephemeral=True)
             return
-        # Order by side so Side A fighters stack together, then Side B,
-        # even though each is its own embed card.
         ordered = sorted(battle.fighters, key=lambda f: f.side)
         embeds = [build_fighter_embed(f) for f in ordered]
         await interaction.response.send_message(embeds=embeds)
 
-    @app_commands.command(name="setstatus", description="Manually set a fighter's active status (testing only)")
+    @app_commands.command(name="setstatus", description="Manually set a fighter's status (testing/admin tool)")
     @app_commands.describe(
         fighter="Fighter name",
-        status_name="burn, bleed, tremor, rupture, sinking, poise, charge, or none",
+        status_name="Which status to set, or 'none' to clear all statuses",
+        potency="Potency (ignored if status_name is none)",
+        count="Count (ignored if status_name is none)",
     )
-    async def setstatus(self, interaction: discord.Interaction, fighter: str, status_name: str):
+    @app_commands.choices(
+        status_name=[app_commands.Choice(name=s.capitalize(), value=s) for s in INFLICTABLE_STATUSES]
+        + [app_commands.Choice(name="None (clear all)", value="none")]
+    )
+    async def setstatus(
+        self,
+        interaction: discord.Interaction,
+        fighter: str,
+        status_name: app_commands.Choice[str],
+        potency: int = 0,
+        count: int = 0,
+    ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
             await interaction.response.send_message("No active battle here.", ephemeral=True)
@@ -161,9 +331,18 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message(f"No fighter named {fighter}.", ephemeral=True)
             return
 
-        status_name = status_name.lower()
-        target_fighter.set_status(None if status_name == "none" else status_name)
-        await interaction.response.send_message(f"Set {target_fighter.name}'s active status to {status_name}.")
+        if status_name.value == "none":
+            target_fighter.statuses.clear()
+            await interaction.response.send_message(f"Cleared all statuses on {target_fighter.name}.")
+            return
+
+        target_fighter.set_status_instance(
+            StatusInstance(name=status_name.value, potency=potency, count=count)
+        )
+        await interaction.response.send_message(
+            f"Set {target_fighter.name}'s {status_emoji(status_name.value)} "
+            f"{status_name.name} to {potency}/{count}."
+        )
 
     @app_commands.command(name="addskill", description="Give a fighter a skill")
     @app_commands.describe(
@@ -172,6 +351,14 @@ class BattleCog(commands.GroupCog, name="battle"):
         base_power="Base Power",
         coin_power="Coin Power",
         coins="Number of coins (1-4)",
+        damage_type="Slash, Blunt, or Pierce",
+        status_name="Status this skill inflicts on hit, if any (optional)",
+        status_potency="Potency added per hit, before resistance (optional, default 0)",
+        status_count="Count/stacks added per hit (optional, default 0)",
+    )
+    @app_commands.choices(
+        damage_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in DAMAGE_TYPES],
+        status_name=[app_commands.Choice(name=s.capitalize(), value=s) for s in INFLICTABLE_STATUSES],
     )
     async def addskill(
         self,
@@ -181,6 +368,10 @@ class BattleCog(commands.GroupCog, name="battle"):
         base_power: int,
         coin_power: int,
         coins: int,
+        damage_type: app_commands.Choice[str],
+        status_name: app_commands.Choice[str] | None = None,
+        status_potency: int = 0,
+        status_count: int = 0,
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -196,12 +387,35 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message("Coins must be between 1 and 4.", ephemeral=True)
             return
 
-        skill = Skill(name=skill_name, base_power=base_power, coin_power=coin_power, coins=coins)
-        target_fighter.add_skill(skill)
-        await interaction.response.send_message(
-            f"{target_fighter.name} learned {skill_name} "
-            f"(Base {base_power}, +{coin_power} Coin Power, {coins} coins)."
+        skill = Skill(
+            name=skill_name,
+            base_power=base_power,
+            coin_power=coin_power,
+            coins=coins,
+            damage_type=damage_type.value,
+            status_name=status_name.value if status_name else None,
+            status_potency=status_potency,
+            status_count=status_count,
         )
+        # NOT added to the fighter yet, that only happens if Confirm is
+        # pressed, inside SkillConfirmView.confirm(). This whole preview
+        # is ephemeral, only you can see it until you confirm.
+
+        coin_preview = " ".join(coin_emoji("base") for _ in range(coins))
+        status_note = ""
+        if status_name:
+            status_note = (
+                f", inflicts {status_emoji(status_name.value)} {status_name.name} "
+                f"({status_potency} potency, +{status_count} count)"
+            )
+        preview_text = (
+            f"{target_fighter.name} would learn {skill_name} {coin_preview}\n"
+            f"(Base {base_power}, +{coin_power} Coin Power, {coins} coins, "
+            f"{damage_type_emoji(damage_type.value)} {damage_type.name}{status_note})."
+        )
+
+        view = SkillConfirmView(target_fighter, skill, preview_text)
+        await interaction.response.send_message(preview_text, view=view, ephemeral=True)
 
     @app_commands.command(name="declare", description="Declare a skill and target for this round")
     @app_commands.describe(
@@ -244,8 +458,13 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         caster.declare(skill, target_fighter)
         await interaction.response.send_message(
-            f"{caster.name} declares {skill.name} targeting {target_fighter.name}."
+            f"{caster.name} declares {skill.name} targeting {target_fighter.name}.",
+            ephemeral=True,
         )
+        # Separate public followup, visible to everyone, but with no
+        # details about which skill or who was targeted, that stays
+        # private to the caller above.
+        await interaction.followup.send(f"**{caster.name} has finished their declaration.**")
 
     @app_commands.command(name="combat", description="Resolve everyone's declared actions this Combat Phase")
     async def combat(self, interaction: discord.Interaction):
@@ -261,7 +480,10 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        log_lines = [f"Combat Phase, Round {battle.round_number}", ""]
+        embed = discord.Embed(
+            title=f"Combat Phase, Round {battle.round_number}",
+            color=0x5865F2,
+        )
         already_resolved: set[str] = set()
 
         acting_order = sorted(
@@ -285,50 +507,65 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
 
             if is_clash:
-                result_a = resolve_skill(fighter.declared_skill)
-                result_b = resolve_skill(target.declared_skill)
-                log_lines.append(f"Clash: {fighter.name} vs {target.name}")
-                log_lines.append(result_a.log())
-                log_lines.append(result_b.log())
+                outcome = resolve_round_clash(fighter.declared_skill, target.declared_skill)
+                winner = fighter if outcome.winner == "a" else target
+                loser = target if winner is fighter else fighter
 
-                winner_result = resolve_clash(result_a, result_b)
-                if winner_result is None:
-                    log_lines.append("**It's a tie. No damage dealt.**")
-                    log_lines.append("")
-                else:
-                    winner = fighter if winner_result is result_a else target
-                    loser = target if winner is fighter else fighter
-                    loser.take_damage(winner_result.total_damage)
-                    log_lines.append(
-                        f"**{winner.name} wins the clash.** {loser.name} takes {winner_result.total_damage} damage. "
-                        f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
-                    )
-                    log_lines.append("")
+                total_damage, status_log = apply_incoming_hit(
+                    winner.declared_skill, outcome.total_damage(), loser
+                )
+                loser.take_damage(total_damage)
+
+                field_value = format_clash_rounds(outcome, fighter.name, target.name)
+                field_value += (
+                    f"\n\n**{winner.name}'s final attack** "
+                    f"({outcome.winner_final_result.skill.coins} coins remaining):\n"
+                )
+                field_value += format_skill_result(outcome.winner_final_result)
+                field_value += (
+                    f"\n\n**{winner.name} wins the clash.** {loser.name} takes {total_damage} damage. "
+                    f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
+                )
+                if status_log:
+                    field_value += "\n" + "\n".join(status_log)
+
+                if len(field_value) > 1024:
+                    field_value = field_value[:1000] + "\n...(truncated)"
+
+                embed.add_field(name=f"Clash: {fighter.name} vs {target.name}", value=field_value, inline=False)
 
                 already_resolved.add(fighter.name)
                 already_resolved.add(target.name)
 
             else:
                 result = resolve_skill(fighter.declared_skill)
-                log_lines.append(f"{fighter.name} attacks {target.name} (unopposed)")
-                log_lines.append(result.log())
-                target.take_damage(result.total_damage)
-                log_lines.append(
-                    f"{target.name} takes {result.total_damage} damage. "
+                total_damage, status_log = apply_incoming_hit(
+                    fighter.declared_skill, result.total_damage, target
+                )
+                target.take_damage(total_damage)
+
+                field_value = format_skill_result(result)
+                field_value += (
+                    f"\n\n{target.name} takes {total_damage} damage. "
                     f"({target.name}: {target.hp}/{target.max_hp} HP)"
                 )
-                log_lines.append("")
+                if status_log:
+                    field_value += "\n" + "\n".join(status_log)
+
+                if len(field_value) > 1024:
+                    field_value = field_value[:1000] + "\n...(truncated)"
+
+                embed.add_field(
+                    name=f"{fighter.name} attacks {target.name} (unopposed)",
+                    value=field_value,
+                    inline=False,
+                )
                 already_resolved.add(fighter.name)
 
         battle.start_new_round()
-        log_lines.append("")
-        log_lines.append(battle.summary())
+        embed.add_field(name="Battle State", value=battle.summary(), inline=False)
 
-        full_log = "\n".join(log_lines)
-        if len(full_log) <= 2000:
-            await interaction.response.send_message(full_log)
-        else:
-            await interaction.response.send_message(full_log[:1990] + "\n...(truncated)")
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="end", description="End the battle in this channel")
     async def end(self, interaction: discord.Interaction):

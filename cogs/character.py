@@ -10,6 +10,8 @@ from game.character import (
     delete_character,
     list_characters_by_owner,
 )
+from game.resistances import ALL_RESISTANCE_TYPES, DAMAGE_TYPES
+from game.emojis import status_emoji, damage_type_emoji
 
 WEBHOOK_NAME = "Character Proxy"
 
@@ -37,6 +39,13 @@ def build_character_embed(character: Character, owner_name: str) -> discord.Embe
     embed.add_field(name="SP", value=str(character.sp), inline=True)
     embed.add_field(name="Speed", value=str(character.speed), inline=True)
     embed.add_field(name="Power", value=str(character.power), inline=True)
+
+    resist_lines = []
+    for k, v in character.resistances.items():
+        icon = damage_type_emoji(k) if k in DAMAGE_TYPES else status_emoji(k)
+        resist_lines.append(f"{icon} {k.capitalize()}: {v}%")
+    embed.add_field(name="Resistances", value="\n".join(resist_lines), inline=False)
+
     embed.set_footer(text=f"Owner: {owner_name}")
     return embed
 
@@ -211,6 +220,40 @@ class CharacterCog(commands.GroupCog, name="character"):
         save_character(character)
         await interaction.response.send_message(
             f"Updated {character.name}: {', '.join(changes)}.", ephemeral=True
+        )
+
+    @app_commands.command(name="resistance", description="Set one of a character's resistances")
+    @app_commands.describe(
+        name="Character name",
+        resistance_type="Which resistance to set",
+        value="Resistance percent. Over 100 fully blocks it, negative is a weakness (takes more)",
+    )
+    @app_commands.choices(
+        resistance_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in ALL_RESISTANCE_TYPES]
+    )
+    async def resistance(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        resistance_type: app_commands.Choice[str],
+        value: int,
+    ):
+        character = load_character(name)
+        if character is None:
+            await interaction.response.send_message(f"No character named {name}.", ephemeral=True)
+            return
+
+        is_owner = interaction.user.id == character.owner_id
+        if not (is_owner or is_admin(interaction)):
+            await interaction.response.send_message(
+                "Only this character's owner or an admin can edit it.", ephemeral=True
+            )
+            return
+
+        character.resistances[resistance_type.value] = value
+        save_character(character)
+        await interaction.response.send_message(
+            f"Set {character.name}'s {resistance_type.name} resistance to {value}%.", ephemeral=True
         )
 
     @app_commands.command(name="delete", description="Delete one of your characters")

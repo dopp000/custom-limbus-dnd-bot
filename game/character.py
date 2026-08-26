@@ -1,6 +1,8 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from game.resistances import DEFAULT_RESISTANCES
 
 CHARACTERS_DIR = "data/characters"
 
@@ -19,6 +21,7 @@ class Character:
     sp: int = 15
     speed: int = 10
     power: int = 6
+    resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
 
     def to_dict(self) -> dict:
         return {
@@ -30,10 +33,18 @@ class Character:
             "sp": self.sp,
             "speed": self.speed,
             "power": self.power,
+            "resistances": self.resistances,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Character":
+        # Characters saved before resistances existed won't have that key.
+        # Merge onto the defaults so old files still load instead of
+        # crashing with a missing-field error.
+        data = dict(data)
+        resistances = dict(DEFAULT_RESISTANCES)
+        resistances.update(data.get("resistances", {}))
+        data["resistances"] = resistances
         return cls(**data)
 
 

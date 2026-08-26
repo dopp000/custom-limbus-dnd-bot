@@ -6,5 +6,15 @@
   "max_hp": 100,
   "sp": 15,
   "speed": 10,
-  "power": 6
+  "power": 6,
+  "resistances": {
+    "slash": 25,
+    "blunt": 0,
+    "pierce": 0,
+    "burn": 0,
+    "bleed": 0,
+    "tremor": 0,
+    "rupture": 0,
+    "sinking": 0
+  }
 }

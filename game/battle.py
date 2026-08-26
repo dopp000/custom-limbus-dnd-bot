@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 from game.skills import Skill
+from game.statuses import StatusInstance
+from game.resistances import DEFAULT_RESISTANCES
 
 
 @dataclass
@@ -15,25 +17,24 @@ class Fighter:
     power: int = 6
     skill_slots: int = 3
     avatar_url: str | None = None
+    resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
 
     skills: dict[str, Skill] = field(default_factory=dict)
     declared_skill: Skill | None = None
     declared_target: "Fighter | None" = None
 
-    # Temporary: tracks a single "primary" status name, only for picking the
-    # embed border color right now. The real Count/Potency status engine
-    # replaces this later, this is just a stand-in so we have something
-    # real to test the visual layer against.
-    active_status: str | None = None
+    # Real status engine now, keyed by status name. Replaces the earlier
+    # placeholder single active_status string.
+    statuses: dict[str, StatusInstance] = field(default_factory=dict)
 
     @classmethod
     def from_character(cls, character, side: str) -> "Fighter":
-        """Builds a Fighter pre-filled with a saved Character's stats and avatar.
+        """Builds a Fighter pre-filled with a saved Character's stats,
+        avatar, and resistances.
 
-        Accepts anything with .name/.hp/.max_hp/.sp/.speed/.power/.avatar_url
-        (a game.character.Character, in practice). Deliberately not importing
-        Character here, since Python does not enforce type hints at runtime,
-        this keeps game/battle.py from needing to know game/character.py exists.
+        Accepts anything with the right attributes (a game.character.Character,
+        in practice). Deliberately not importing Character here, keeps
+        game/battle.py from needing to know game/character.py exists.
         """
         return cls(
             name=character.name,
@@ -44,10 +45,20 @@ class Fighter:
             speed=character.speed,
             power=character.power,
             avatar_url=character.avatar_url,
+            resistances=dict(character.resistances),
         )
 
-    def set_status(self, status_name: str | None):
-        self.active_status = status_name
+    def get_status(self, name: str) -> StatusInstance | None:
+        return self.statuses.get(name)
+
+    def set_status_instance(self, instance: StatusInstance):
+        """Stores a status instance, or removes it entirely if its Count
+        has reached 0 (no point keeping an empty, expired entry around).
+        """
+        if instance.count <= 0:
+            self.statuses.pop(instance.name, None)
+        else:
+            self.statuses[instance.name] = instance
 
     def is_alive(self) -> bool:
         return self.hp > 0
