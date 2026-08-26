@@ -1,5 +1,5 @@
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -11,12 +11,28 @@ class Skill:
     coin_power: int
     coins: int
     damage_type: str = "blunt"  # "slash", "blunt", or "pierce"
-    # If set, this skill inflicts the named status on its target when it hits.
-    # status_potency/status_count are the RAW values before resistance is
-    # applied, resistance gets applied by the caller at hit-resolution time.
-    status_name: str | None = None
-    status_potency: int = 0
-    status_count: int = 0
+
+    # Per-coin status effects, one entry per coin (aligned by index).
+    # coin_statuses[i] is None if that coin inflicts nothing. Potency/
+    # count are the RAW values before resistance, resistance gets applied
+    # by the caller (apply_incoming_hit in cogs/battle.py) at hit time.
+    # Status names are not restricted to a fixed list, this same shape
+    # covers keyword statuses (Rupture, Bleed, ...) and non-keyword ones
+    # (Fragile, Bind, Power Down, ...) equally.
+    coin_statuses: list[str | None] = field(default_factory=list)
+    coin_status_potencies: list[int] = field(default_factory=list)
+    coin_status_counts: list[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Pads status lists up to `coins` entries if a Skill gets built
+        # without explicitly passing them (quick construction, tests),
+        # so nothing that indexes into these lists breaks.
+        while len(self.coin_statuses) < self.coins:
+            self.coin_statuses.append(None)
+        while len(self.coin_status_potencies) < self.coins:
+            self.coin_status_potencies.append(0)
+        while len(self.coin_status_counts) < self.coins:
+            self.coin_status_counts.append(0)
 
 
 @dataclass
@@ -49,7 +65,13 @@ class SkillResult:
         lines = [f"**{self.skill.name}** (Base {self.skill.base_power}, +{self.skill.coin_power} Coin Power, {self.skill.coins} coins)"]
         for i, c in enumerate(self.coin_results, start=1):
             face = "Heads" if c.heads else "Tails"
-            lines.append(f"  Coin {i}: {face}, Power {c.power_after}, {c.damage_dealt} damage")
+            status_note = ""
+            if i - 1 < len(self.skill.coin_statuses) and self.skill.coin_statuses[i - 1]:
+                name = self.skill.coin_statuses[i - 1]
+                potency = self.skill.coin_status_potencies[i - 1]
+                count = self.skill.coin_status_counts[i - 1]
+                status_note = f", inflicts {name} {potency}/{count}"
+            lines.append(f"  Coin {i}: {face}, Power {c.power_after}, {c.damage_dealt} damage{status_note}")
         lines.append(f"  **Total: {self.total_damage} damage**")
         return "\n".join(lines)
 
@@ -230,6 +252,11 @@ def resolve_round_clash(
     deals damage. The attrition rounds themselves never deal damage,
     they only decide who wins and how many coins the winner has left.
 
+    The winner's per-coin status lists are sliced down to match however
+    many coins survived, keeping the FIRST N entries (front-loading
+    status onto early coin slots is a real strategic choice, since those
+    are the ones most likely to make it through attrition intact).
+
     heads_chance_a/heads_chance_b are each side's OWN Sanity-driven odds
     (Fighter.heads_chance()), applied to every toss on that side, both
     during attrition and on the final damage toss.
@@ -277,7 +304,13 @@ def resolve_round_clash(
     winner_remaining = coins_a if winner == "a" else coins_b
     winner_heads_chance = heads_chance_a if winner == "a" else heads_chance_b
 
-    final_skill = replace(winner_skill, coins=winner_remaining)
+    final_skill = replace(
+        winner_skill,
+        coins=winner_remaining,
+        coin_statuses=winner_skill.coin_statuses[:winner_remaining],
+        coin_status_potencies=winner_skill.coin_status_potencies[:winner_remaining],
+        coin_status_counts=winner_skill.coin_status_counts[:winner_remaining],
+    )
     final_result = resolve_skill(final_skill, winner_heads_chance)
 
     return ClashOutcome(winner=winner, rounds=rounds, winner_final_result=final_result)

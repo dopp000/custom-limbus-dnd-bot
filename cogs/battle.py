@@ -58,19 +58,14 @@ class SkillConfirmView(discord.ui.View):
         self.stop()
 
     async def on_timeout(self):
-        # Nobody clicked within the timeout window. The skill was never
-        # added (that only happens inside confirm()), so there's nothing
-        # to undo, just let the buttons go stale silently.
         for child in self.children:
             child.disabled = True
 
 
 def format_skill_result(result: SkillResult, survived: list[bool] | None = None) -> str:
-    """Discord-facing version of SkillResult.log() (game/skills.py).
-    same coin-by-coin breakdown, but with real Heads/Tails emoji instead
-    of plain text. Kept separate from .log() on purpose: .log() stays
-    plain-text so it's still usable for quick REPL testing without any
-    Discord/emoji setup involved.
+    """Discord-facing version of SkillResult.log(): same coin-by-coin
+    breakdown, real Heads/Tails emoji, and each coin's own status shown
+    as PotencyStatusCount (e.g. 3:Rupture:2) right next to that coin.
 
     If `survived` is given (one bool per coin, from a pairwise clash),
     destroyed coins are struck through and excluded from the total.
@@ -83,7 +78,16 @@ def format_skill_result(result: SkillResult, survived: list[bool] | None = None)
     for i, c in enumerate(result.coin_results, start=1):
         face = coin_emoji("heads") if c.heads else coin_emoji("tails")
         alive = survived[i - 1] if survived is not None else True
-        line = f"  Coin {i}: {face} Power {c.power_after}, {c.damage_dealt} damage"
+
+        status_tag = ""
+        idx = i - 1
+        if idx < len(result.skill.coin_statuses) and result.skill.coin_statuses[idx]:
+            name = result.skill.coin_statuses[idx]
+            potency = result.skill.coin_status_potencies[idx]
+            count = result.skill.coin_status_counts[idx]
+            status_tag = f" {potency}{status_emoji(name)}{count}"
+
+        line = f"  Coin {i}: {face} Power {c.power_after}, {c.damage_dealt} damage{status_tag}"
         if not alive:
             line = f"~~{line.strip()}~~ (destroyed)"
             lines.append(f"  {line}")
@@ -141,57 +145,71 @@ def build_fighter_embed(fighter: Fighter) -> discord.Embed:
     return embed
 
 
-def apply_incoming_hit(attacker_skill: Skill, raw_damage: int, target: Fighter) -> tuple[int, list[str]]:
-    """One fighter just landed a hit on another. This handles everything
-    that happens to the TARGET as a result:
+def apply_incoming_hit(attacker_skill: Skill, result: SkillResult, target: Fighter) -> tuple[int, list[str]]:
+    """A fighter's skill just hit (or clash-won against) a target.
 
-    1. The attacking skill's damage_type gets reduced by the target's
-       resistance for that type.
-    2. If the target currently has Rupture, it triggers: deals its stored
-       Potency as bonus damage, then decays (Count -1, or fully clears if
-       that was the last stack). Rupture is the only status with an
-       automatic on-hit trigger wired up so far.
-    3. If the attacking skill inflicts a NEW status, it layers on top
-       (after step 2's decay, if the status happens to be Rupture, so the
-       stacking rules from game/statuses.py apply correctly), with the
-       incoming Potency reduced by the target's resistance for that status.
+    Walks the skill's coins ONE AT A TIME, in order, since each coin is
+    its OWN hit for status purposes:
+
+    For each coin, in sequence:
+      1. That coin's raw damage gets reduced by the target's resistance
+         for the skill's damage_type.
+      2. If the target currently has Rupture, it triggers on THIS coin's
+         hit: deals its stored Potency as bonus damage, then decays.
+         A multi-coin skill can trigger Rupture more than once, once per
+         coin that lands, matching "next Y times this unit is hit."
+      3. If THIS coin inflicts a status (coin_statuses[i] is set), it
+         layers on top, with potency reduced by the target's resistance
+         for that status name. Works for any status name, keyword or not.
 
     Returns (total_damage_to_apply, log_lines_describing_what_happened).
     """
-    log = []
+    log: list[str] = []
+    total_damage = 0
 
-    resisted_damage = apply_resistance(raw_damage, target.resistances.get(attacker_skill.damage_type, 0))
-    total_damage = resisted_damage
-    if resisted_damage != raw_damage:
-        log.append(
-            f"({damage_type_emoji(attacker_skill.damage_type)} "
-            f"{attacker_skill.damage_type.capitalize()} resistance: {raw_damage} -> {resisted_damage})"
-        )
+    for i, coin in enumerate(result.coin_results):
+        raw = coin.damage_dealt
+        resisted = apply_resistance(raw, target.resistances.get(attacker_skill.damage_type, 0))
+        if resisted != raw:
+            log.append(
+                f"Coin {i + 1}: ({damage_type_emoji(attacker_skill.damage_type)} "
+                f"{attacker_skill.damage_type.capitalize()} resistance: {raw} -> {resisted})"
+            )
+        coin_total = resisted
 
-    decayed_rupture = None
-    rupture = target.get_status("rupture")
-    if rupture is not None:
-        total_damage += rupture.potency
-        log.append(f"{status_emoji('rupture')} Rupture triggers on {target.name}: +{rupture.potency} damage")
-        decayed_rupture = decay_after_trigger(rupture)
-        target.set_status_instance(decayed_rupture)
+        decayed_rupture = None
+        rupture = target.get_status("rupture")
+        if rupture is not None:
+            coin_total += rupture.potency
+            log.append(
+                f"Coin {i + 1}: {status_emoji('rupture')} Rupture triggers on "
+                f"{target.name}: +{rupture.potency} damage"
+            )
+            decayed_rupture = decay_after_trigger(rupture)
+            target.set_status_instance(decayed_rupture)
 
-    if attacker_skill.status_name:
-        resistance_pct = target.resistances.get(attacker_skill.status_name, 0)
-        added_potency = apply_resistance(attacker_skill.status_potency, resistance_pct)
-        added_count = attacker_skill.status_count
+        status_name = attacker_skill.coin_statuses[i] if i < len(attacker_skill.coin_statuses) else None
+        if status_name:
+            resistance_pct = target.resistances.get(status_name, 0)
+            raw_potency = (
+                attacker_skill.coin_status_potencies[i]
+                if i < len(attacker_skill.coin_status_potencies) else 0
+            )
+            added_potency = apply_resistance(raw_potency, resistance_pct)
+            added_count = (
+                attacker_skill.coin_status_counts[i]
+                if i < len(attacker_skill.coin_status_counts) else 0
+            )
 
-        if attacker_skill.status_name == "rupture":
-            current = decayed_rupture
-        else:
-            current = target.get_status(attacker_skill.status_name)
+            current = decayed_rupture if status_name == "rupture" else target.get_status(status_name)
+            new_instance = apply_status(current, status_name, added_potency, added_count)
+            target.set_status_instance(new_instance)
+            log.append(
+                f"Coin {i + 1}: {target.name} gains {status_emoji(status_name)} "
+                f"{status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
+            )
 
-        new_instance = apply_status(current, attacker_skill.status_name, added_potency, added_count)
-        target.set_status_instance(new_instance)
-        log.append(
-            f"{target.name} gains {status_emoji(attacker_skill.status_name)} "
-            f"{attacker_skill.status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
-        )
+        total_damage += coin_total
 
     return total_damage, log
 
@@ -278,7 +296,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             battle.add_fighter(fighter)
             await interaction.response.send_message(
                 f"Added {fighter.name} to Side {side}, pulled from saved character "
-                f"(HP {fighter.hp}, SP {fighter.sp}, Speed {fighter.speed}, Power {fighter.power})."
+                f"(HP {fighter.hp}, Sanity {fighter.sanity}, Speed {fighter.speed}, Power {fighter.power})."
             )
             return
 
@@ -355,13 +373,15 @@ class BattleCog(commands.GroupCog, name="battle"):
         coin_power="Coin Power",
         coins="Number of coins (1-4)",
         damage_type="Slash, Blunt, or Pierce",
-        status_name="Status this skill inflicts on hit, if any (optional)",
-        status_potency="Potency added per hit, before resistance (optional, default 0)",
-        status_count="Count/stacks added per hit (optional, default 0)",
+        status_input=(
+            "Per-coin statuses, comma-separated, one entry per coin. "
+            "Each entry is 'none' or 'Name:Potency:Count'. Works for any status "
+            "name, keyword (Rupture, Bleed...) or not (Fragile, Bind...). "
+            "Example for 3 coins: none,Rupture:3:2,Bleed:1:1"
+        ),
     )
     @app_commands.choices(
         damage_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in DAMAGE_TYPES],
-        status_name=[app_commands.Choice(name=s.capitalize(), value=s) for s in INFLICTABLE_STATUSES],
     )
     async def addskill(
         self,
@@ -372,9 +392,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         coin_power: int,
         coins: int,
         damage_type: app_commands.Choice[str],
-        status_name: app_commands.Choice[str] | None = None,
-        status_potency: int = 0,
-        status_count: int = 0,
+        status_input: str = "none",
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -390,31 +408,80 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message("Coins must be between 1 and 4.", ephemeral=True)
             return
 
+        tokens = [t.strip() for t in status_input.split(",")]
+        # A single "none" (the default) applies to every coin, no need to
+        # type it once per coin.
+        if len(tokens) == 1 and tokens[0].lower() == "none":
+            tokens = ["none"] * coins
+
+        if len(tokens) != coins:
+            await interaction.response.send_message(
+                f"status_input needs exactly {coins} comma-separated entries (one per coin), "
+                f"got {len(tokens)}. Use 'none' for a coin with no status. "
+                f"Example: {','.join(['none'] * coins)}",
+                ephemeral=True,
+            )
+            return
+
+        coin_statuses: list[str | None] = []
+        coin_status_potencies: list[int] = []
+        coin_status_counts: list[int] = []
+
+        for i, token in enumerate(tokens):
+            if token.lower() == "none":
+                coin_statuses.append(None)
+                coin_status_potencies.append(0)
+                coin_status_counts.append(0)
+                continue
+
+            parts = token.split(":")
+            if len(parts) != 3:
+                await interaction.response.send_message(
+                    f"Coin {i + 1} entry '{token}' is invalid. Use 'Name:Potency:Count' or 'none'.",
+                    ephemeral=True,
+                )
+                return
+
+            status_name_raw, potency_raw, count_raw = parts
+            try:
+                potency = int(potency_raw)
+                count = int(count_raw)
+            except ValueError:
+                await interaction.response.send_message(
+                    f"Coin {i + 1} entry '{token}' has a non-numeric potency/count.",
+                    ephemeral=True,
+                )
+                return
+
+            coin_statuses.append(status_name_raw.strip().lower())
+            coin_status_potencies.append(potency)
+            coin_status_counts.append(count)
+
         skill = Skill(
             name=skill_name,
             base_power=base_power,
             coin_power=coin_power,
             coins=coins,
             damage_type=damage_type.value,
-            status_name=status_name.value if status_name else None,
-            status_potency=status_potency,
-            status_count=status_count,
+            coin_statuses=coin_statuses,
+            coin_status_potencies=coin_status_potencies,
+            coin_status_counts=coin_status_counts,
         )
         # NOT added to the fighter yet, that only happens if Confirm is
-        # pressed, inside SkillConfirmView.confirm(). This whole preview
-        # is ephemeral, only you can see it until you confirm.
+        # pressed, inside SkillConfirmView.confirm().
 
-        coin_preview = " ".join(coin_emoji("base") for _ in range(coins))
-        status_note = ""
-        if status_name:
-            status_note = (
-                f", inflicts {status_emoji(status_name.value)} {status_name.name} "
-                f"({status_potency} potency, +{status_count} count)"
-            )
+        coin_lines = []
+        for i in range(coins):
+            tag = coin_emoji("base")
+            if coin_statuses[i]:
+                tag += f" ({coin_status_potencies[i]}{status_emoji(coin_statuses[i])}{coin_status_counts[i]})"
+            coin_lines.append(tag)
+
         preview_text = (
-            f"{target_fighter.name} would learn {skill_name} {coin_preview}\n"
+            f"{target_fighter.name} would learn {skill_name}\n"
             f"(Base {base_power}, +{coin_power} Coin Power, {coins} coins, "
-            f"{damage_type_emoji(damage_type.value)} {damage_type.name}{status_note})."
+            f"{damage_type_emoji(damage_type.value)} {damage_type.name})\n"
+            + " ".join(coin_lines)
         )
 
         view = SkillConfirmView(target_fighter, skill, preview_text)
@@ -464,9 +531,6 @@ class BattleCog(commands.GroupCog, name="battle"):
             f"{caster.name} declares {skill.name} targeting {target_fighter.name}.",
             ephemeral=True,
         )
-        # Separate public followup, visible to everyone, but with no
-        # details about which skill or who was targeted, that stays
-        # private to the caller above.
         await interaction.followup.send(f"**{caster.name} has finished their declaration.**")
 
     @app_commands.command(name="combat", description="Resolve everyone's declared actions this Combat Phase")
@@ -522,7 +586,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 loser.lose_sanity(SANITY_CLASH_LOSS)
 
                 total_damage, status_log = apply_incoming_hit(
-                    winner.declared_skill, outcome.total_damage(), loser
+                    winner.declared_skill, outcome.winner_final_result, loser
                 )
                 loser.take_damage(total_damage)
 
@@ -558,7 +622,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 fighter.gain_sanity(sanity_gain)
 
                 total_damage, status_log = apply_incoming_hit(
-                    fighter.declared_skill, result.total_damage, target
+                    fighter.declared_skill, result, target
                 )
                 target.take_damage(total_damage)
 
