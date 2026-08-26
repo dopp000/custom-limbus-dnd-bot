@@ -17,9 +17,6 @@ WEBHOOK_NAME = "Character Proxy"
 
 
 async def resolve_owner_name(guild: discord.Guild | None, owner_id: int) -> str:
-    """Tries the local member cache first, falls back to an API call if
-    the member isn't cached yet. This is what fixes "Owner: Unknown".
-    """
     if guild is None:
         return "Unknown"
     member = guild.get_member(owner_id)
@@ -56,11 +53,6 @@ def is_admin(interaction: discord.Interaction) -> bool:
 
 
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
-    """Reuses an existing proxy webhook in this channel if one already
-    exists (created by a previous /character say call), otherwise makes
-    a new one. Webhooks live on Discord's side and persist on their own,
-    so we do not need to store anything about them ourselves.
-    """
     existing = await channel.webhooks()
     for webhook in existing:
         if webhook.name == WEBHOOK_NAME:
