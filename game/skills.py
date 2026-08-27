@@ -1,6 +1,8 @@
 import random
 from dataclasses import dataclass, field, replace
 
+from game.conditions import Trigger, TriggerContext, evaluate_condition
+
 
 @dataclass
 class Skill:
@@ -22,6 +24,13 @@ class Skill:
     coin_statuses: list[str | None] = field(default_factory=list)
     coin_status_potencies: list[int] = field(default_factory=list)
     coin_status_counts: list[int] = field(default_factory=list)
+
+    # Skill-level Conditional Triggers, independent of the per-coin
+    # status system above. Evaluated once per resolution via
+    # resolve_triggers below, not per coin, since a trigger's condition
+    # (target's HP, caster's Sanity, etc.) doesn't change coin to coin
+    # within a single resolution.
+    triggers: list[Trigger] = field(default_factory=list)
 
     def __post_init__(self):
         # Pads status lists up to `coins` entries if a Skill gets built
@@ -106,6 +115,37 @@ def resolve_skill(skill: Skill, heads_chance: int = 50) -> SkillResult:
         results.append(CoinResult(heads=heads, power_after=power, damage_dealt=power))
 
     return SkillResult(skill=skill, coin_results=results)
+
+
+def resolve_triggers(skill: Skill, context: TriggerContext) -> tuple[Skill, list[Trigger]]:
+    """Evaluates every trigger on a skill against the current context.
+
+    Pre-roll effects (bonus_power, bonus_coin_power) are baked into a
+    modified copy of the skill immediately, since they have to apply
+    before coins are ever tossed -- this is why it returns a (possibly
+    new) Skill rather than mutating in place. Post-hit effects
+    (inflict_status, sanity_gain) are NOT applied here, they're only
+    evaluated and returned as "fired", so the caller can apply them
+    alongside normal hit resolution (see apply_trigger_effects in
+    cogs/battle.py) only if the skill actually lands -- a losing side of
+    a clash never hits, so its post-hit triggers should never fire even
+    though its pre-roll bonuses still legitimately affected the clash
+    math.
+    """
+    fired = [t for t in skill.triggers if evaluate_condition(t.condition, context)]
+
+    bonus_power = sum(t.effect_value for t in fired if t.effect_type == "bonus_power")
+    bonus_coin_power = sum(t.effect_value for t in fired if t.effect_type == "bonus_coin_power")
+
+    if bonus_power or bonus_coin_power:
+        skill = replace(
+            skill,
+            base_power=skill.base_power + bonus_power,
+            coin_power=skill.coin_power + bonus_coin_power,
+        )
+
+    post_hit = [t for t in fired if t.effect_type in ("inflict_status", "sanity_gain")]
+    return skill, post_hit
 
 
 def resolve_clash(result_a: SkillResult, result_b: SkillResult) -> SkillResult | None:

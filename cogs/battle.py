@@ -6,15 +6,23 @@ from game.battle import (
     Battle, Fighter, DeclaredAction, BATTLE_TYPES,
     SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
 )
-from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash
+from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
+from game.conditions import Trigger, TriggerContext, parse_trigger_input
 from game.colors import get_status_color
 from game.character import load_character
 from game.statuses import StatusInstance, decay_after_trigger, apply_status, INFLICTABLE_STATUSES
 from game.resistances import DAMAGE_TYPES, apply_resistance
-from game.emojis import status_emoji, coin_emoji, damage_type_emoji, stat_emoji, skill_slot_emoji
+from game.emojis import status_emoji, coin_emoji, damage_type_emoji, stat_emoji, skill_slot_emoji, hint_emoji
 
 LOG_CHANNEL_ID = 1538071557560213595  # #bot-combat-logs
 MAX_EMBED_FIELDS = 25  # Discord's hard limit on fields per embed
+
+# Magnitude (potency * count) thresholds for the status-based half of a
+# fighter's Hint tier, checked highest first. Rupture then gets a flat
+# +1 on top of whatever tier its own magnitude lands on, since its
+# automatic on-hit trigger makes it a real threat even at low numbers,
+# not because it's inherently worse than the others at equal magnitude.
+STATUS_HINT_THRESHOLDS = [(15, 3), (6, 2), (1, 1)]
 
 
 class SkillConfirmView(discord.ui.View):
@@ -59,31 +67,29 @@ class SkillConfirmView(discord.ui.View):
 
 
 def _skill_preview_text(skill: Skill) -> str:
-    """Short, readable summary of a skill's numbers, used both in the
-    addskill confirmation and in the clash scouting preview shown to a
-    caster before they lock in a declare.
-    """
     coin_bits = []
     for i in range(skill.coins):
         tag = coin_emoji("base")
         if skill.coin_statuses[i]:
             tag += f" ({skill.coin_status_potencies[i]}{status_emoji(skill.coin_statuses[i])}{skill.coin_status_counts[i]})"
         coin_bits.append(tag)
-    return (
+    text = (
         f"**{skill.name}** (Base {skill.base_power}, +{skill.coin_power} Coin Power, "
         f"{skill.coins} coins, {damage_type_emoji(skill.damage_type)} {skill.damage_type.capitalize()})\n"
         + " ".join(coin_bits)
     )
+    if skill.triggers:
+        trigger_lines = "\n".join(
+            f"  Trigger: {t.condition.type} -> {t.effect_type}"
+            f"{f' {t.effect_value}' if t.effect_type != 'inflict_status' else f' {t.status_name} {t.effect_value}/{t.status_count}'}"
+            f" ({hint_emoji(t.hint_tier)})"
+            for t in skill.triggers
+        )
+        text += f"\n{trigger_lines}"
+    return text
 
 
 class ClashDeclareView(discord.ui.View):
-    """Shown only to the declaring user, never the target. Confirms
-    locking in a slot-targeted declare, either an informed choice
-    (caster's slot was fast enough to scout the target's slot) or a
-    blind one (too slow, or the target hasn't assigned that slot yet),
-    in which case this doubles as the "this may resolve unopposed"
-    warning.
-    """
     def __init__(
         self,
         caster: Fighter,
@@ -133,23 +139,6 @@ class ClashDeclareView(discord.ui.View):
 
 
 class StealApprovalView(discord.ui.View):
-    """DMed only to whichever ally currently holds the contested clash.
-    Never seen by the stealer, the enemy being fought over, or anyone in
-    a shared channel, since that would leak the request to the opposing
-    side.
-
-    stealer/stealer_skill/stealer_slot describe the faster ally trying to
-    take over the clash. ally/ally_slot describe whoever currently owns
-    it and must approve giving it up -- this can be the ORIGINAL ally, or
-    a PREVIOUS stealer who took it over earlier and is now being asked to
-    hand it off again (a chain). target/target_slot is the shared enemy
-    slot everyone is contesting.
-
-    Multiple independent requests for the same clash are allowed to exist
-    at once, on purpose (no locking): if two different DMs both get
-    approved, the later approval simply wins, and whoever it displaced
-    gets notified so they can sort it out with the other player directly.
-    """
     def __init__(
         self,
         stealer: Fighter,
@@ -174,14 +163,9 @@ class StealApprovalView(discord.ui.View):
         self.bot = bot
         self.battle = battle
         self.responded = False
-        self.message: discord.Message | None = None  # set by caller after sending the DM
+        self.message: discord.Message | None = None
 
     def _lock_in_unopposed(self):
-        """Shared fallback for decline/timeout/closed-DMs: the stealer's
-        action still locks in, but since the target's action still points
-        at whoever currently holds the clash (never touched here), it
-        just falls through to unopposed.
-        """
         self.stealer.declare_in_slot(
             self.stealer_slot, self.stealer_skill, self.target, self.target_slot
         )
@@ -214,11 +198,6 @@ class StealApprovalView(discord.ui.View):
         target_action = self.target.declared_actions.get(self.target_slot)
         previous_holder = target_action.target if target_action is not None else None
 
-        # Only clear the ally's own slot if they're still the one actually
-        # holding the clash right now. If a different, independent steal
-        # request already got approved first, self.ally lost the clash to
-        # someone else before this button was even pressed, so there's
-        # nothing of theirs left here to clear.
         if previous_holder is self.ally:
             self.ally.undeclare(self.ally_slot)
 
@@ -230,10 +209,6 @@ class StealApprovalView(discord.ui.View):
             self.stealer_slot, self.stealer_skill, self.target, self.target_slot
         )
 
-        # If someone else was actually holding the clash at the moment
-        # this got approved (a race between two independent requests),
-        # let them know they just got bumped, so it doesn't invisibly
-        # change under them.
         if previous_holder is not None and previous_holder is not self.ally:
             await self._notify_overtaken(previous_holder)
 
@@ -335,6 +310,59 @@ def format_clash_rounds(outcome: ClashOutcome, name_a: str, name_b: str) -> str:
     return "\n".join(lines)
 
 
+def _status_hint_tier(fighter: Fighter) -> int:
+    """The worse of a fighter's currently active statuses, mapped to a
+    tier by magnitude (potency * count). Rupture gets a flat +1 on top
+    of its magnitude tier, capped at 3, since its automatic on-hit
+    trigger makes any active Rupture a live threat regardless of size.
+    """
+    best = 0
+    for status in fighter.statuses.values():
+        if status.count <= 0:
+            continue
+        magnitude = status.potency * status.count
+        tier = 0
+        for threshold, t in STATUS_HINT_THRESHOLDS:
+            if magnitude >= threshold:
+                tier = t
+                break
+        if status.name == "rupture":
+            tier = min(3, max(tier, 1) + 1) if tier > 0 else 2
+        best = max(best, tier)
+    return best
+
+
+def _skill_hint_tier(fighter: Fighter, battle: Battle) -> int:
+    """The highest hint_tier among the fighter's known skills whose
+    trigger condition currently reads true against at least one living
+    enemy. Speculative, this doesn't require the skill to actually be
+    declared, it's meant to warn "this fighter COULD hit hard right now
+    if they use this."
+    """
+    enemies = [f for f in battle.fighters if f.side != fighter.side and f.is_alive()]
+    if not enemies:
+        return 0
+    best = 0
+    for skill in fighter.skills.values():
+        for trigger in skill.triggers:
+            for enemy in enemies:
+                context = TriggerContext(caster=fighter, target=enemy, battle=battle)
+                from game.conditions import evaluate_condition
+                if evaluate_condition(trigger.condition, context):
+                    best = max(best, trigger.hint_tier)
+                    break
+    return best
+
+
+def compute_hint_tier(fighter: Fighter, battle: Battle) -> int | None:
+    """The tier to show on this fighter's Hint line: the higher of their
+    live-triggerable skill danger and their active status danger.
+    Returns None if there's nothing worth flagging.
+    """
+    tier = max(_skill_hint_tier(fighter, battle), _status_hint_tier(fighter))
+    return tier if tier > 0 else None
+
+
 def build_fighter_embed(fighter: Fighter) -> discord.Embed:
     primary_status = next(iter(fighter.statuses), None)
     embed = discord.Embed(
@@ -363,11 +391,6 @@ def build_fighter_embed(fighter: Fighter) -> discord.Embed:
 
 
 def build_battle_embed(battle: Battle) -> discord.Embed:
-    """The persistent, edit-in-place battlefield view. Each fighter's
-    slot line shows that slot's own rolled Speed next to its icon
-    (filled = coin icon, unfilled = numbered slot icon) since slot
-    speeds are public information both sides can see and plan around.
-    """
     type_info = BATTLE_TYPES.get(battle.battle_type, BATTLE_TYPES["spar"])
     embed = discord.Embed(title=type_info["title"], color=type_info["color"])
 
@@ -394,9 +417,13 @@ def build_battle_embed(battle: Battle) -> discord.Embed:
             else:
                 tag = f" -- **{filled}/{f.skill_slots} declared**"
             down_tag = " (Down)" if not f.is_alive() else ""
+
+            hint_tier = compute_hint_tier(f, battle)
+            hint_line = f"\n-# {hint_emoji(hint_tier)} Hint" if hint_tier else ""
+
             lines.append(
                 f"**{f.name}**{down_tag} ({stat_emoji('hp')} {f.hp}/{f.max_hp}, "
-                f"{stat_emoji('sanity')} {f.sanity}){tag}\n{slot_line}"
+                f"{stat_emoji('sanity')} {f.sanity}){tag}\n{slot_line}{hint_line}"
             )
         embed.add_field(name=f"Side {side_name}", value="\n\n".join(lines), inline=False)
 
@@ -469,6 +496,31 @@ def apply_incoming_hit(attacker_skill: Skill, result: SkillResult, target: Fight
         total_damage += coin_total
 
     return total_damage, log
+
+
+def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter) -> list[str]:
+    """Applies the post-hit effects (inflict_status, sanity_gain) from
+    whichever triggers fired AND actually landed a hit. Pre-roll effects
+    (bonus_power/bonus_coin_power) are already baked into the skill by
+    resolve_triggers before this ever runs, so there's nothing to do for
+    those here.
+    """
+    log: list[str] = []
+    for t in triggers:
+        if t.effect_type == "inflict_status":
+            resistance_pct = target.resistances.get(t.status_name, 0)
+            added_potency = apply_resistance(t.effect_value, resistance_pct)
+            current = target.get_status(t.status_name)
+            new_instance = apply_status(current, t.status_name, added_potency, t.status_count)
+            target.set_status_instance(new_instance)
+            log.append(
+                f"Trigger: {target.name} gains {status_emoji(t.status_name)} "
+                f"{t.status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
+            )
+        elif t.effect_type == "sanity_gain":
+            caster.gain_sanity(t.effect_value)
+            log.append(f"Trigger: {caster.name} Sanity +{t.effect_value} ({caster.sanity})")
+    return log
 
 
 class BattleCog(commands.GroupCog, name="battle"):
@@ -581,11 +633,6 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        # owner_id is set to whoever ran this command. For a host adding an
-        # NPC on someone else's behalf, that means steal-approval DMs (see
-        # StealApprovalView) go to the host, not to whichever player might
-        # be piloting the NPC in the roleplay. No @user param to override
-        # this yet, flag if that's a problem in practice.
         fighter = Fighter(name=name, side=side, hp=hp, max_hp=hp, owner_id=interaction.user.id)
         if speed_min is not None:
             fighter.speed_min = speed_min
@@ -660,9 +707,13 @@ class BattleCog(commands.GroupCog, name="battle"):
         damage_type="Slash, Blunt, or Pierce",
         status_input=(
             "Per-coin statuses, comma-separated, one entry per coin. "
-            "Each entry is 'none' or 'Name:Potency:Count'. Works for any status "
-            "name, keyword (Rupture, Bleed...) or not (Fragile, Bind...). "
+            "Each entry is 'none' or 'Name:Potency:Count'. "
             "Example for 3 coins: none,Rupture:3:2,Bleed:1:1"
+        ),
+        trigger_input=(
+            "Conditional Triggers, semicolon-separated, each one "
+            "'condition|effect|hint:N'. 'none' for no triggers. "
+            "Example: target_status:burn:1:0|bonus_power:8|hint:2"
         ),
     )
     @app_commands.choices(
@@ -678,6 +729,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         coins: int,
         damage_type: app_commands.Choice[str],
         status_input: str = "none",
+        trigger_input: str = "none",
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -740,6 +792,16 @@ class BattleCog(commands.GroupCog, name="battle"):
             coin_status_potencies.append(potency)
             coin_status_counts.append(count)
 
+        try:
+            triggers = parse_trigger_input(trigger_input)
+        except (ValueError, IndexError) as e:
+            await interaction.response.send_message(
+                f"trigger_input error: {e}\nFormat: 'condition|effect|hint:N', "
+                "multiple triggers separated by ';', or 'none'.",
+                ephemeral=True,
+            )
+            return
+
         skill = Skill(
             name=skill_name,
             base_power=base_power,
@@ -749,6 +811,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             coin_statuses=coin_statuses,
             coin_status_potencies=coin_status_potencies,
             coin_status_counts=coin_status_counts,
+            triggers=triggers,
         )
 
         preview_text = f"{target_fighter.name} would learn {skill_name}\n" + _skill_preview_text(skill)
@@ -832,19 +895,6 @@ class BattleCog(commands.GroupCog, name="battle"):
         caster_speed = caster.slot_speed(slot)
         target_speed = target_fighter.slot_speed(target_slot)
 
-        # --- Clash-steal check -------------------------------------------------
-        # If the target's slot is already locked in a real mutual clash with
-        # one of the CASTER'S OWN allies (or with an earlier stealer who
-        # already took it over -- find_mutual_clash_partner just returns
-        # whoever currently holds it), this isn't a normal declare, it's an
-        # attempt to take over the clash. Two conditions must BOTH hold:
-        # the caster must be strictly faster than whoever currently holds
-        # it, AND strictly faster than the target itself. Without the
-        # second check, a caster only tied with the target could still
-        # trigger a steal DM despite having no real way to land a clash on
-        # that target at all -- that case just falls through the normal
-        # flow below instead, which naturally resolves as unopposed since
-        # the target's action never points back at the caster.
         partner_info = battle.find_mutual_clash_partner(target_fighter, target_slot)
         if partner_info is not None:
             partner, partner_slot = partner_info
@@ -914,7 +964,6 @@ class BattleCog(commands.GroupCog, name="battle"):
                     ephemeral=True,
                 )
                 return
-        # --- end clash-steal check ----------------------------------------------
 
         scouted_skill = target_fighter.get_declared_skill_in_slot(target_slot)
         can_scout = caster_speed >= target_speed and scouted_skill is not None
@@ -1034,6 +1083,11 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         units.sort(key=unit_speed, reverse=True)
 
+        # Tracks whether we've resolved anything yet this Combat Phase, for
+        # the first_hit_of_round Trigger condition. One clash counts as a
+        # single event (both sides share the same flag value).
+        first_action_done = False
+
         for u in units:
             if u[0] == "clash":
                 _, entry_a, entry_b = u
@@ -1041,14 +1095,27 @@ class BattleCog(commands.GroupCog, name="battle"):
                 if not fighter_a.is_alive() or not fighter_b.is_alive():
                     continue
 
+                context_a = TriggerContext(
+                    caster=fighter_a, target=fighter_b, battle=battle,
+                    is_first_hit_of_round=not first_action_done,
+                )
+                context_b = TriggerContext(
+                    caster=fighter_b, target=fighter_a, battle=battle,
+                    is_first_hit_of_round=not first_action_done,
+                )
+                skill_a, post_hit_a = resolve_triggers(entry_a["skill"], context_a)
+                skill_b, post_hit_b = resolve_triggers(entry_b["skill"], context_b)
+                first_action_done = True
+
                 outcome = resolve_round_clash(
-                    entry_a["skill"], entry_b["skill"],
+                    skill_a, skill_b,
                     heads_chance_a=fighter_a.heads_chance(),
                     heads_chance_b=fighter_b.heads_chance(),
                 )
                 winner = fighter_a if outcome.winner == "a" else fighter_b
                 loser = fighter_b if winner is fighter_a else fighter_a
-                winner_skill = entry_a["skill"] if outcome.winner == "a" else entry_b["skill"]
+                winner_skill = skill_a if outcome.winner == "a" else skill_b
+                winner_post_hit = post_hit_a if outcome.winner == "a" else post_hit_b
 
                 winner.gain_sanity(SANITY_CLASH_WIN)
                 loser.lose_sanity(SANITY_CLASH_LOSS)
@@ -1057,6 +1124,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     winner_skill, outcome.winner_final_result, loser
                 )
                 loser.take_damage(total_damage)
+                trigger_log = apply_trigger_effects(winner_post_hit, winner, loser)
 
                 field_value = format_clash_rounds(outcome, fighter_a.name, fighter_b.name)
                 field_value += (
@@ -1074,6 +1142,8 @@ class BattleCog(commands.GroupCog, name="battle"):
                 )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
+                if trigger_log:
+                    field_value += "\n" + "\n".join(trigger_log)
                 if len(field_value) > 1024:
                     field_value = field_value[:1000] + "\n...(truncated)"
 
@@ -1089,13 +1159,21 @@ class BattleCog(commands.GroupCog, name="battle"):
                 if not fighter.is_alive() or not target.is_alive():
                     continue
 
-                result = resolve_skill(entry["skill"], fighter.heads_chance())
+                context = TriggerContext(
+                    caster=fighter, target=target, battle=battle,
+                    is_first_hit_of_round=not first_action_done,
+                )
+                adjusted_skill, post_hit = resolve_triggers(entry["skill"], context)
+                first_action_done = True
+
+                result = resolve_skill(adjusted_skill, fighter.heads_chance())
                 heads_landed = sum(1 for c in result.coin_results if c.heads)
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log = apply_incoming_hit(entry["skill"], result, target)
+                total_damage, status_log = apply_incoming_hit(adjusted_skill, result, target)
                 target.take_damage(total_damage)
+                trigger_log = apply_trigger_effects(post_hit, fighter, target)
 
                 field_value = format_skill_result(result)
                 field_value += (
@@ -1105,6 +1183,8 @@ class BattleCog(commands.GroupCog, name="battle"):
                 field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
+                if trigger_log:
+                    field_value += "\n" + "\n".join(trigger_log)
                 if len(field_value) > 1024:
                     field_value = field_value[:1000] + "\n...(truncated)"
 
