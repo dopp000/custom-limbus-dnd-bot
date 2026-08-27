@@ -29,6 +29,12 @@ class DeclaredAction:
     target_slot is which of the TARGET's slots this action is aimed at.
     A real Clash only happens if the target's own action in target_slot
     points back at (this caster, slot) -- see combat() in cogs/battle.py.
+
+    target and target_slot are deliberately mutable (not frozen), since a
+    speed-priority clash steal can silently redirect an already-declared
+    action's target onto a different enemy after the fact, without the
+    original caster knowing beforehand. See Battle.find_mutual_clash_partner
+    and StealApprovalView in cogs/battle.py.
     """
     skill: Skill
     target: "Fighter"
@@ -48,6 +54,14 @@ class Fighter:
     skill_slots: int = 3
     avatar_url: str | None = None
     resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
+
+    # Discord user ID of whoever controls this fighter. Set from
+    # Character.owner_id for saved characters, or from whoever ran
+    # /battle addfighter for a one-off NPC. Used to DM this fighter's
+    # controller for things they need to privately approve, like a
+    # clash-steal request, since ephemeral replies only reach whoever
+    # is actually running the current slash command.
+    owner_id: int | None = None
 
     # The range each of this fighter's skill slots rolls its own Speed
     # from, once per round (e.g. 4-7). Defaults to a constant range equal
@@ -92,6 +106,7 @@ class Fighter:
             power=character.power,
             avatar_url=character.avatar_url,
             resistances=dict(character.resistances),
+            owner_id=character.owner_id,
         )
 
     def roll_slot_speeds(self):
@@ -222,6 +237,35 @@ class Battle:
             for f in self.fighters
             if f.is_alive()
         )
+
+    def find_mutual_clash_partner(self, target: Fighter, target_slot: int) -> tuple[Fighter, int] | None:
+        """Checks whether target's target_slot is currently locked in a
+        real mutual clash with some other fighter: that fighter's own
+        declared action targets exactly target's target_slot, AND
+        target's action in target_slot targets exactly that fighter's
+        slot back.
+
+        Returns (fighter, slot) of that clash partner, or None if
+        target_slot isn't currently in a genuine mutual clash (nothing
+        declared there yet, or only a one-sided declare so far).
+
+        Used to detect a clash-steal situation: if a third fighter also
+        wants target's target_slot, and this returns a partner on that
+        third fighter's own side, the partner is the ally who'd have to
+        approve giving up the clash. See StealApprovalView in
+        cogs/battle.py.
+        """
+        target_action = target.declared_actions.get(target_slot)
+        if target_action is None:
+            return None
+        partner = target_action.target
+        partner_slot = target_action.target_slot
+        partner_action = partner.declared_actions.get(partner_slot)
+        if partner_action is None:
+            return None
+        if partner_action.target is target and partner_action.target_slot == target_slot:
+            return partner, partner_slot
+        return None
 
     def start_new_round(self):
         self.round_number += 1
