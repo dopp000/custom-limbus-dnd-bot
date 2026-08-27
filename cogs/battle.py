@@ -133,14 +133,22 @@ class ClashDeclareView(discord.ui.View):
 
 
 class StealApprovalView(discord.ui.View):
-    """DMed only to the ally whose clash is being contested. Never seen by
-    the stealer, the enemy being fought over, or anyone in a shared
-    channel, since that would leak the request to the opposing side.
+    """DMed only to whichever ally currently holds the contested clash.
+    Never seen by the stealer, the enemy being fought over, or anyone in
+    a shared channel, since that would leak the request to the opposing
+    side.
 
     stealer/stealer_skill/stealer_slot describe the faster ally trying to
-    take over the clash. ally/ally_slot describe the slower ally who
-    currently owns it and must approve giving it up. target/target_slot
-    is the shared enemy slot both of them want.
+    take over the clash. ally/ally_slot describe whoever currently owns
+    it and must approve giving it up -- this can be the ORIGINAL ally, or
+    a PREVIOUS stealer who took it over earlier and is now being asked to
+    hand it off again (a chain). target/target_slot is the shared enemy
+    slot everyone is contesting.
+
+    Multiple independent requests for the same clash are allowed to exist
+    at once, on purpose (no locking): if two different DMs both get
+    approved, the later approval simply wins, and whoever it displaced
+    gets notified so they can sort it out with the other player directly.
     """
     def __init__(
         self,
@@ -171,11 +179,30 @@ class StealApprovalView(discord.ui.View):
     def _lock_in_unopposed(self):
         """Shared fallback for decline/timeout/closed-DMs: the stealer's
         action still locks in, but since the target's action still points
-        at the ally (never touched), it just falls through to unopposed.
+        at whoever currently holds the clash (never touched here), it
+        just falls through to unopposed.
         """
         self.stealer.declare_in_slot(
             self.stealer_slot, self.stealer_skill, self.target, self.target_slot
         )
+
+    async def _notify_overtaken(self, previous_holder: Fighter):
+        if previous_holder.owner_id is None:
+            return
+        owner = self.bot.get_user(previous_holder.owner_id)
+        if owner is None:
+            try:
+                owner = await self.bot.fetch_user(previous_holder.owner_id)
+            except discord.NotFound:
+                return
+        try:
+            await owner.send(
+                f"{self.stealer.name} has taken over the clash against {self.target.name}'s "
+                f"Slot {self.target_slot} instead of {previous_holder.name}. {previous_holder.name}'s "
+                f"action there will resolve unopposed unless you declare something else."
+            )
+        except discord.Forbidden:
+            pass
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -184,9 +211,17 @@ class StealApprovalView(discord.ui.View):
             return
         self.responded = True
 
-        self.ally.undeclare(self.ally_slot)
-
         target_action = self.target.declared_actions.get(self.target_slot)
+        previous_holder = target_action.target if target_action is not None else None
+
+        # Only clear the ally's own slot if they're still the one actually
+        # holding the clash right now. If a different, independent steal
+        # request already got approved first, self.ally lost the clash to
+        # someone else before this button was even pressed, so there's
+        # nothing of theirs left here to clear.
+        if previous_holder is self.ally:
+            self.ally.undeclare(self.ally_slot)
+
         if target_action is not None:
             target_action.target = self.stealer
             target_action.target_slot = self.stealer_slot
@@ -194,6 +229,13 @@ class StealApprovalView(discord.ui.View):
         self.stealer.declare_in_slot(
             self.stealer_slot, self.stealer_skill, self.target, self.target_slot
         )
+
+        # If someone else was actually holding the clash at the moment
+        # this got approved (a race between two independent requests),
+        # let them know they just got bumped, so it doesn't invisibly
+        # change under them.
+        if previous_holder is not None and previous_holder is not self.ally:
+            await self._notify_overtaken(previous_holder)
 
         for child in self.children:
             child.disabled = True
@@ -792,14 +834,26 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         # --- Clash-steal check -------------------------------------------------
         # If the target's slot is already locked in a real mutual clash with
-        # one of the CASTER'S OWN allies, and the caster's slot is faster
-        # than that ally's, this isn't a normal declare at all: it's an
-        # attempt to take over the clash. That needs the ally's private
-        # approval, so it skips the usual scouting preview entirely.
+        # one of the CASTER'S OWN allies (or with an earlier stealer who
+        # already took it over -- find_mutual_clash_partner just returns
+        # whoever currently holds it), this isn't a normal declare, it's an
+        # attempt to take over the clash. Two conditions must BOTH hold:
+        # the caster must be strictly faster than whoever currently holds
+        # it, AND strictly faster than the target itself. Without the
+        # second check, a caster only tied with the target could still
+        # trigger a steal DM despite having no real way to land a clash on
+        # that target at all -- that case just falls through the normal
+        # flow below instead, which naturally resolves as unopposed since
+        # the target's action never points back at the caster.
         partner_info = battle.find_mutual_clash_partner(target_fighter, target_slot)
         if partner_info is not None:
             partner, partner_slot = partner_info
-            if partner is not caster and partner.side == caster.side and caster_speed > partner.slot_speed(partner_slot):
+            if (
+                partner is not caster
+                and partner.side == caster.side
+                and caster_speed > partner.slot_speed(partner_slot)
+                and caster_speed > target_speed
+            ):
                 if partner.owner_id is None:
                     caster.declare_in_slot(slot, skill, target_fighter, target_slot)
                     await interaction.response.send_message(
