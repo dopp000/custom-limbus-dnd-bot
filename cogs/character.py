@@ -33,7 +33,13 @@ def build_character_embed(character: Character, owner_name: str) -> discord.Embe
     if character.avatar_url:
         embed.set_thumbnail(url=character.avatar_url)
     embed.add_field(name="HP", value=f"{character.hp}/{character.max_hp}", inline=True)
-    embed.add_field(name="Speed", value=str(character.speed), inline=True)
+
+    speed_display = (
+        f"{character.speed_min}-{character.speed_max}"
+        if character.speed_min is not None
+        else str(character.speed)
+    )
+    embed.add_field(name="Speed", value=speed_display, inline=True)
     embed.add_field(name="Power", value=str(character.power), inline=True)
 
     resist_lines = []
@@ -142,7 +148,9 @@ class CharacterCog(commands.GroupCog, name="character"):
         new_name="Rename the character (optional)",
         avatar="New avatar image (optional)",
         hp="New max HP, also heals to full (optional)",
-        speed="New Speed (optional)",
+        speed="New flat Speed, only used if speed_min isn't also set (optional)",
+        speed_min="Lowest a skill slot's Speed can roll each round (optional, sets a range instead of a flat Speed)",
+        speed_max="Highest a skill slot's Speed can roll each round (optional, defaults to speed_min if omitted)",
         power="New Power (optional)",
     )
     async def edit(
@@ -153,6 +161,8 @@ class CharacterCog(commands.GroupCog, name="character"):
         avatar: discord.Attachment | None = None,
         hp: int | None = None,
         speed: int | None = None,
+        speed_min: int | None = None,
+        speed_max: int | None = None,
         power: int | None = None,
     ):
         character = load_character(name)
@@ -164,6 +174,13 @@ class CharacterCog(commands.GroupCog, name="character"):
         if not (is_owner or is_admin(interaction)):
             await interaction.response.send_message(
                 "Only this character's owner or an admin can edit it.", ephemeral=True
+            )
+            return
+
+        if speed_max is not None and speed_min is None:
+            await interaction.response.send_message(
+                "speed_max needs speed_min too (provide both, or just speed_min alone for a flat value).",
+                ephemeral=True,
             )
             return
 
@@ -191,6 +208,11 @@ class CharacterCog(commands.GroupCog, name="character"):
         if speed is not None:
             character.speed = speed
             changes.append(f"Speed -> {speed}")
+
+        if speed_min is not None:
+            character.speed_min = speed_min
+            character.speed_max = speed_max if speed_max is not None else speed_min
+            changes.append(f"Speed range -> {character.speed_min}-{character.speed_max}")
 
         if power is not None:
             character.power = power

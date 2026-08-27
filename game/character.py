@@ -23,7 +23,9 @@ class Character:
     avatar_url: str | None = None
     hp: int = 100
     max_hp: int = 100
-    speed: int = 10
+    speed: int = 10  # legacy flat speed, used as-is if speed_min/speed_max are unset
+    speed_min: int | None = None  # lowest a skill slot's Speed can roll, per round
+    speed_max: int | None = None  # highest a skill slot's Speed can roll, per round
     power: int = 6
     resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
 
@@ -35,6 +37,8 @@ class Character:
             "hp": self.hp,
             "max_hp": self.max_hp,
             "speed": self.speed,
+            "speed_min": self.speed_min,
+            "speed_max": self.speed_max,
             "power": self.power,
             "resistances": self.resistances,
         }
@@ -52,7 +56,10 @@ class Character:
         # Forward-compatible: drop any keys that no longer exist as real
         # fields (e.g. old saves still carrying "sp" from before the
         # Sanity merge), so old character files load instead of crashing
-        # with an unexpected-keyword-argument error.
+        # with an unexpected-keyword-argument error. This also means old
+        # saves from before speed_min/speed_max existed load fine, they
+        # just don't have those keys and the dataclass default (None)
+        # kicks in.
         valid_fields = {f.name for f in dataclasses.fields(cls)}
         data = {k: v for k, v in data.items() if k in valid_fields}
 

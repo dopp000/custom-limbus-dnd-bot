@@ -67,8 +67,8 @@ class Fighter:
     # from, once per round (e.g. 4-7). Defaults to a constant range equal
     # to `speed`, so a fighter with no explicit range set just behaves
     # like every slot has the same fixed speed, matching the old
-    # single-speed behavior. A real per-character range (set via
-    # /character edit) is a follow-up, not wired in yet.
+    # single-speed behavior. Real per-character ranges (set via
+    # /character edit) are pulled in by from_character below.
     speed_min: int | None = None
     speed_max: int | None = None
 
@@ -97,7 +97,7 @@ class Fighter:
 
     @classmethod
     def from_character(cls, character, side: str) -> "Fighter":
-        return cls(
+        fighter = cls(
             name=character.name,
             side=side,
             hp=character.hp,
@@ -108,6 +108,19 @@ class Fighter:
             resistances=dict(character.resistances),
             owner_id=character.owner_id,
         )
+        # If the saved character has its own speed range (set via
+        # /character edit), it takes over from the flat speed default
+        # that __post_init__ already applied above, and slots are
+        # rerolled against the real range. /battle addfighter's own
+        # speed_min/speed_max params still override this afterward if
+        # the host passes them, since that runs after this returns.
+        if character.speed_min is not None:
+            fighter.speed_min = character.speed_min
+            fighter.speed_max = (
+                character.speed_max if character.speed_max is not None else character.speed_min
+            )
+            fighter.roll_slot_speeds()
+        return fighter
 
     def roll_slot_speeds(self):
         """Rerolls every skill slot's own Speed within [speed_min, speed_max].
