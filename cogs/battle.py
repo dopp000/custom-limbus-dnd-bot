@@ -59,8 +59,8 @@ class SkillConfirmView(discord.ui.View):
 
 
 def _skill_preview_text(skill: Skill) -> str:
-    """Short, readable summary of a skill's numbers -- used both in the
-    addskill confirmation and in the clash-scouting preview shown to a
+    """Short, readable summary of a skill's numbers, used both in the
+    addskill confirmation and in the clash scouting preview shown to a
     caster before they lock in a declare.
     """
     coin_bits = []
@@ -78,7 +78,7 @@ def _skill_preview_text(skill: Skill) -> str:
 
 class ClashDeclareView(discord.ui.View):
     """Shown only to the declaring user, never the target. Confirms
-    locking in a slot-targeted declare -- either an informed choice
+    locking in a slot-targeted declare, either an informed choice
     (caster's slot was fast enough to scout the target's slot) or a
     blind one (too slow, or the target hasn't assigned that slot yet),
     in which case this doubles as the "this may resolve unopposed"
@@ -207,7 +207,7 @@ def build_fighter_embed(fighter: Fighter) -> discord.Embed:
 
 def build_battle_embed(battle: Battle) -> discord.Embed:
     """The persistent, edit-in-place battlefield view. Each fighter's
-    slot line now shows that slot's own rolled Speed next to its icon
+    slot line shows that slot's own rolled Speed next to its icon
     (filled = coin icon, unfilled = numbered slot icon) since slot
     speeds are public information both sides can see and plan around.
     """
@@ -646,6 +646,20 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message(f"No fighter named {target}.", ephemeral=True)
             return
 
+        if target_fighter is caster:
+            await interaction.response.send_message(
+                f"{caster.name} can't target themselves.", ephemeral=True
+            )
+            return
+
+        if target_fighter.side == caster.side:
+            await interaction.response.send_message(
+                f"{caster.name} can't target {target_fighter.name}, they're on the same side "
+                f"(Side {caster.side}). Only enemies can be targeted.",
+                ephemeral=True,
+            )
+            return
+
         if not (1 <= target_slot <= target_fighter.skill_slots):
             await interaction.response.send_message(
                 f"{target_fighter.name} only has skill slots 1-{target_fighter.skill_slots}.",
@@ -732,11 +746,6 @@ class BattleCog(commands.GroupCog, name="battle"):
                 return
             embed.add_field(name=name, value=value, inline=False)
 
-        # Flatten every living fighter's per-slot declared actions into
-        # one list. Each entry now carries its OWN slot and target_slot,
-        # since a fighter can have several independent actions in flight
-        # at once (one per used skill slot), each possibly aimed at a
-        # different enemy and a different one of that enemy's slots.
         entries = []
         for f in battle.fighters:
             if not f.is_alive():
@@ -747,12 +756,6 @@ class BattleCog(commands.GroupCog, name="battle"):
                     "slot": slot_num, "target_slot": action.target_slot, "used": False,
                 })
 
-        # Pair entries into Clashes: entry A clashes with entry B only if
-        # they target EACH OTHER'S EXACT SLOTS -- A's target_slot must
-        # equal B's own slot, and vice versa. Anything less specific
-        # (right fighter, wrong slot) falls through to unopposed instead,
-        # matching the scouting mechanic: only a real mutual slot lock
-        # produces a Clash.
         units = []
         for i, entry in enumerate(entries):
             if entry["used"]:
