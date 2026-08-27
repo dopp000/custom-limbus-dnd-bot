@@ -132,6 +132,121 @@ class ClashDeclareView(discord.ui.View):
             child.disabled = True
 
 
+class StealApprovalView(discord.ui.View):
+    """DMed only to the ally whose clash is being contested. Never seen by
+    the stealer, the enemy being fought over, or anyone in a shared
+    channel, since that would leak the request to the opposing side.
+
+    stealer/stealer_skill/stealer_slot describe the faster ally trying to
+    take over the clash. ally/ally_slot describe the slower ally who
+    currently owns it and must approve giving it up. target/target_slot
+    is the shared enemy slot both of them want.
+    """
+    def __init__(
+        self,
+        stealer: Fighter,
+        stealer_skill: Skill,
+        stealer_slot: int,
+        ally: Fighter,
+        ally_slot: int,
+        target: Fighter,
+        target_slot: int,
+        bot: commands.Bot,
+        battle: Battle,
+        timeout: float = 120,
+    ):
+        super().__init__(timeout=timeout)
+        self.stealer = stealer
+        self.stealer_skill = stealer_skill
+        self.stealer_slot = stealer_slot
+        self.ally = ally
+        self.ally_slot = ally_slot
+        self.target = target
+        self.target_slot = target_slot
+        self.bot = bot
+        self.battle = battle
+        self.responded = False
+        self.message: discord.Message | None = None  # set by caller after sending the DM
+
+    def _lock_in_unopposed(self):
+        """Shared fallback for decline/timeout/closed-DMs: the stealer's
+        action still locks in, but since the target's action still points
+        at the ally (never touched), it just falls through to unopposed.
+        """
+        self.stealer.declare_in_slot(
+            self.stealer_slot, self.stealer_skill, self.target, self.target_slot
+        )
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.responded:
+            await interaction.response.send_message("This request was already answered.", ephemeral=True)
+            return
+        self.responded = True
+
+        self.ally.undeclare(self.ally_slot)
+
+        target_action = self.target.declared_actions.get(self.target_slot)
+        if target_action is not None:
+            target_action.target = self.stealer
+            target_action.target_slot = self.stealer_slot
+
+        self.stealer.declare_in_slot(
+            self.stealer_slot, self.stealer_skill, self.target, self.target_slot
+        )
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=(
+                f"Approved. {self.stealer.name}'s Slot {self.stealer_slot} now clashes "
+                f"{self.target.name}'s Slot {self.target_slot} instead. Your Slot {self.ally_slot} "
+                f"was cleared, use /battle declare again if you want to act elsewhere."
+            ),
+            view=self,
+        )
+        self.stop()
+        await sync_battle_message(self.bot, self.battle)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.responded:
+            await interaction.response.send_message("This request was already answered.", ephemeral=True)
+            return
+        self.responded = True
+        self._lock_in_unopposed()
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"Declined. Your clash against {self.target.name} continues as declared.",
+            view=self,
+        )
+        self.stop()
+        await sync_battle_message(self.bot, self.battle)
+
+    async def on_timeout(self):
+        if self.responded:
+            return
+        self.responded = True
+        self._lock_in_unopposed()
+
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content=(
+                        "No response in time, treated as a decline. Your clash "
+                        f"against {self.target.name} continues as declared."
+                    ),
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+        await sync_battle_message(self.bot, self.battle)
+
+
 def format_skill_result(result: SkillResult, survived: list[bool] | None = None) -> str:
     lines = [
         f"**{result.skill.name}** (Base {result.skill.base_power}, "
@@ -424,7 +539,12 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        fighter = Fighter(name=name, side=side, hp=hp, max_hp=hp)
+        # owner_id is set to whoever ran this command. For a host adding an
+        # NPC on someone else's behalf, that means steal-approval DMs (see
+        # StealApprovalView) go to the host, not to whichever player might
+        # be piloting the NPC in the roleplay. No @user param to override
+        # this yet, flag if that's a problem in practice.
+        fighter = Fighter(name=name, side=side, hp=hp, max_hp=hp, owner_id=interaction.user.id)
         if speed_min is not None:
             fighter.speed_min = speed_min
             fighter.speed_max = speed_max if speed_max is not None else speed_min
@@ -669,8 +789,80 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         caster_speed = caster.slot_speed(slot)
         target_speed = target_fighter.slot_speed(target_slot)
-        scouted_skill = target_fighter.get_declared_skill_in_slot(target_slot)
 
+        # --- Clash-steal check -------------------------------------------------
+        # If the target's slot is already locked in a real mutual clash with
+        # one of the CASTER'S OWN allies, and the caster's slot is faster
+        # than that ally's, this isn't a normal declare at all: it's an
+        # attempt to take over the clash. That needs the ally's private
+        # approval, so it skips the usual scouting preview entirely.
+        partner_info = battle.find_mutual_clash_partner(target_fighter, target_slot)
+        if partner_info is not None:
+            partner, partner_slot = partner_info
+            if partner is not caster and partner.side == caster.side and caster_speed > partner.slot_speed(partner_slot):
+                if partner.owner_id is None:
+                    caster.declare_in_slot(slot, skill, target_fighter, target_slot)
+                    await interaction.response.send_message(
+                        f"{target_fighter.name}'s Slot {target_slot} is already clashing "
+                        f"{partner.name}, and taking it over needs {partner.name}'s owner to "
+                        f"approve, but {partner.name} has no linked owner. Falling through to "
+                        f"unopposed against {target_fighter.name} instead.",
+                        ephemeral=True,
+                    )
+                    await sync_battle_message(self.bot, battle)
+                    return
+
+                owner = self.bot.get_user(partner.owner_id)
+                if owner is None:
+                    try:
+                        owner = await self.bot.fetch_user(partner.owner_id)
+                    except discord.NotFound:
+                        owner = None
+
+                steal_view = StealApprovalView(
+                    caster, skill, slot, partner, partner_slot, target_fighter, target_slot,
+                    self.bot, battle,
+                )
+
+                sent = False
+                if owner is not None:
+                    try:
+                        dm_message = await owner.send(
+                            f"**{caster.name}** (Slot {slot}, Speed {caster_speed}) wants to take "
+                            f"over your **{partner.name}**'s clash against **{target_fighter.name}**'s "
+                            f"Slot {target_slot}, using **{skill.name}**.\n\n"
+                            f"Approve gives it to them (your Slot {partner_slot} is cleared). "
+                            f"Decline keeps your clash as declared, and their action falls through "
+                            f"to unopposed instead.",
+                            view=steal_view,
+                        )
+                        steal_view.message = dm_message
+                        sent = True
+                    except discord.Forbidden:
+                        sent = False
+
+                if not sent:
+                    caster.declare_in_slot(slot, skill, target_fighter, target_slot)
+                    await interaction.response.send_message(
+                        f"Couldn't DM {partner.name}'s owner to ask for approval (DMs closed or "
+                        f"user not found), so this falls through to unopposed against "
+                        f"{target_fighter.name} instead.",
+                        ephemeral=True,
+                    )
+                    await sync_battle_message(self.bot, battle)
+                    return
+
+                await interaction.response.send_message(
+                    f"{target_fighter.name}'s Slot {target_slot} is already clashing "
+                    f"{partner.name}. {partner.name}'s owner has been DMed to ask whether "
+                    f"{caster.name} can take it over instead. Your action locks in either way, "
+                    f"you'll just find out later whether it's a clash or unopposed.",
+                    ephemeral=True,
+                )
+                return
+        # --- end clash-steal check ----------------------------------------------
+
+        scouted_skill = target_fighter.get_declared_skill_in_slot(target_slot)
         can_scout = caster_speed >= target_speed and scouted_skill is not None
 
         view = ClashDeclareView(caster, skill, target_fighter, slot, target_slot, self.bot, battle)
