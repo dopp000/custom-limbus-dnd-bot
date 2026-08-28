@@ -242,7 +242,7 @@ def resolve_triggers(
             coin_power=skill.coin_power + bonus_coin_power,
         )
 
-    post_hit = [t for t in fired if t.effect_type in ("inflict_status", "sanity_gain")]
+    post_hit = [t for t in fired if t.effect_type in ("inflict_status", "sanity_gain", "gain_status")]
     return skill, post_hit
 
 

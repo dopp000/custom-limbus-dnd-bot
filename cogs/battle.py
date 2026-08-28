@@ -590,10 +590,13 @@ def apply_incoming_hit(
 
 
 # Every pre-roll (pre-toss) skill-level timing, in firing order, for a
-# side that's about to enter a Clash. combat_start is handled specially
-# (skipped once battle.started) by _resolve_pre_roll_chain below, so
-# it's listed first here for readability even though the actual skip
-# check happens per-call.
+# side that's about to enter a Clash. combat_start/turn_start used to
+# live in this list too, but only ever fired for whatever skill was
+# actually declared that round -- see fire_passive_triggers below,
+# which now covers ALL of a fighter's known skills instead and is
+# called once per fighter per round, before this per-entry chain ever
+# runs. Keeping them here as well would double-fire them for any skill
+# that happens to be both declared AND carries one of those tags.
 #
 # [Before Attack] is deliberately NOT in this list. It used to be
 # bundled in here alongside [On Use], which meant it fired for BOTH
@@ -604,53 +607,109 @@ def apply_incoming_hit(
 # stays here though: it's genuinely a "the clash begins" moment for
 # both sides, before ANY toss (attrition or final), which is exactly
 # what this pre-roll window represents.
-PRE_ROLL_CLASH_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "clash_start")
+PRE_ROLL_CLASH_TIMINGS = ("before_use", "on_use", "clash_start")
 
 # Same idea for a side making an unopposed attack. [Before Attack]
 # stays here for the solo path -- there's no attrition to distinguish
 # it from, the single toss IS the attack, so firing it at the same
 # pre-roll moment as [On Use] is already correct.
-PRE_ROLL_SOLO_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "before_attack")
+PRE_ROLL_SOLO_TIMINGS = ("before_use", "on_use", "before_attack")
+
+
+def fire_passive_triggers(battle: Battle) -> list[str]:
+    """The persistent Fighter-level buff store this engine was missing:
+    fires [Combat Start] (once per battle) and [Turn Start] (every
+    round) against EVERY skill a living fighter knows, not just
+    whichever one they happened to declare this round. This is what
+    lets a passive like "[Combat Start] Gain 3 Charge" sitting on a
+    skill that never gets used still actually do something.
+
+    There's no per-fighter "turn" separate from the shared round
+    structure in this engine, so [Turn Start] is mapped onto "start of
+    this round's Combat Phase" -- a documented simplification, not a
+    real per-turn system.
+
+    Each fighter's own skills are evaluated with target=None (there's
+    no specific enemy at this moment), so any trigger whose condition
+    actually depends on a target (target_status, speed_faster, ...)
+    correctly never fires here -- see evaluate_condition's handling of
+    a missing target in game/conditions.py. Only effect types that make
+    sense with no live coin toss in progress actually do anything:
+    sanity_gain and gain_status. inflict_status is skipped by
+    apply_trigger_effects (no target to inflict onto); bonus_power/
+    bonus_coin_power are evaluated but have nothing to apply to
+    (there's no skill resolution in progress right now), so writing one
+    against these timings is simply a no-op.
+
+    Returns the combined log lines from every fighter, in fighter order.
+    """
+    timings = ["turn_start"]
+    if not battle.started:
+        timings.append("combat_start")
+
+    log: list[str] = []
+    for fighter in battle.fighters:
+        if not fighter.is_alive():
+            continue
+        for skill in fighter.skills.values():
+            context = TriggerContext(caster=fighter, target=None, battle=battle)
+            for timing in timings:
+                _, post_hit = resolve_triggers(skill, context, timing)
+                log.extend(apply_trigger_effects(post_hit, fighter, None))
+    return log
 
 
 def _resolve_pre_roll_chain(
-    skill: Skill, context: TriggerContext, timings: tuple[str, ...], battle: Battle
+    skill: Skill, context: TriggerContext, timings: tuple[str, ...]
 ) -> tuple[Skill, list[Trigger]]:
     """Chains resolve_triggers across every pre-roll timing in `timings`,
     in order, folding each stage's bonus_power/bonus_coin_power into the
-    skill before the next stage evaluates against it (so e.g. a [Turn
+    skill before the next stage evaluates against it (so e.g. a [Clash
     Start] Power buff is visible to [On Use]'s own condition check), and
     merging every stage's post-hit triggers into one list for the caller
     to apply once the hit actually lands.
 
-    combat_start is silently skipped once battle.started is True (see
-    the comment where that flag gets set in combat()), so it only ever
-    fires during a battle's first Combat Phase. turn_start reuses that
-    same "only fires for whatever skill is actually declared this
-    round" restriction -- see the module-level note on [Combat Start]
-    dispatch for why (no persistent Fighter-level buff store exists yet
-    to let it apply to a skill that ISN'T the one being used this turn,
-    that's a bigger addition queued separately).
+    combat_start/turn_start are NOT in `timings` anymore -- they're
+    fired once per fighter per round, across ALL of that fighter's
+    known skills, by fire_passive_triggers above, before this function
+    ever runs. This function only ever sees the skill actually declared
+    this round, so it no longer needs a `battle` param to check
+    battle.started against.
     """
     post_hit: list[Trigger] = []
     for timing in timings:
-        if timing == "combat_start" and battle.started:
-            continue
         skill, fired = resolve_triggers(skill, context, timing)
         post_hit.extend(fired)
     return skill, post_hit
 
 
-def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter) -> list[str]:
-    """Applies the post-hit effects (inflict_status, sanity_gain) from
-    whichever triggers fired AND actually landed a hit. Pre-roll effects
-    (bonus_power/bonus_coin_power) are already baked into the skill by
-    resolve_triggers before this ever runs, so there's nothing to do for
-    those here.
+def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter | None) -> list[str]:
+    """Applies the post-hit effects (inflict_status, sanity_gain,
+    gain_status) from whichever triggers fired AND actually landed a
+    hit. Pre-roll effects (bonus_power/bonus_coin_power) are already
+    baked into the skill by resolve_triggers before this ever runs, so
+    there's nothing to do for those here.
+
+    target is optional: passive timings that don't reference an enemy
+    (Combat Start, Turn Start) call this with target=None, since there's
+    nobody to inflict a status onto at that moment -- an inflict_status
+    trigger written against one of those timings is simply skipped
+    rather than crashing (writing one there is a modeling mistake on
+    the skill author's part, not something the engine can resolve).
+
+    gain_status was previously parsed by parse_trigger_text but never
+    actually applied anywhere -- a self-buff trigger (e.g. "[Combat
+    Start] Gain 3 Charge") would silently do nothing. Fixed here: it
+    lands on the CASTER's own statuses dict, same layering as
+    inflict_status but with no resistance applied (Poise/Charge are
+    self-buffs, not something an opponent resists -- see the note on
+    INFLICTABLE_STATUSES in game/statuses.py).
     """
     log: list[str] = []
     for t in triggers:
         if t.effect_type == "inflict_status":
+            if target is None:
+                continue
             resistance_pct = target.resistances.get(t.status_name, 0)
             added_potency = apply_resistance(t.effect_value, resistance_pct)
             current = target.get_status(t.status_name)
@@ -663,6 +722,14 @@ def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Figh
         elif t.effect_type == "sanity_gain":
             caster.gain_sanity(t.effect_value)
             log.append(f"Trigger: {caster.name} Sanity +{t.effect_value} ({caster.sanity})")
+        elif t.effect_type == "gain_status":
+            current = caster.get_status(t.status_name)
+            new_instance = apply_status(current, t.status_name, t.effect_value, t.status_count)
+            caster.set_status_instance(new_instance)
+            log.append(
+                f"Trigger: {caster.name} gains {status_emoji(t.status_name)} "
+                f"{t.status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
+            )
     return log
 
 
@@ -1171,6 +1238,16 @@ class BattleCog(commands.GroupCog, name="battle"):
                 return
             embed.add_field(name=name, value=value, inline=False)
 
+        # Fires [Combat Start] (first round of the battle only) and
+        # [Turn Start] (every round) against every living fighter's
+        # FULL skill list, not just whatever they declared -- see
+        # fire_passive_triggers's docstring above. Deliberately happens
+        # before any clash/unopposed resolution below, and before
+        # battle.started flips to True at the end of this method.
+        passive_log = fire_passive_triggers(battle)
+        if passive_log:
+            add_field_safe("Passive Triggers", "\n".join(passive_log)[:1024])
+
         entries = []
         for f in battle.fighters:
             if not f.is_alive():
@@ -1238,10 +1315,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 # for firing order and the documented [Clash Start] /
                 # [Before Attack] scope collapse.
                 skill_a, pre_roll_post_hit_a = _resolve_pre_roll_chain(
-                    entry_a["skill"], context_a, PRE_ROLL_CLASH_TIMINGS, battle
+                    entry_a["skill"], context_a, PRE_ROLL_CLASH_TIMINGS
                 )
                 skill_b, pre_roll_post_hit_b = _resolve_pre_roll_chain(
-                    entry_b["skill"], context_b, PRE_ROLL_CLASH_TIMINGS, battle
+                    entry_b["skill"], context_b, PRE_ROLL_CLASH_TIMINGS
                 )
                 first_action_done = True
 
@@ -1330,7 +1407,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 # Full pre-roll chain -- see PRE_ROLL_SOLO_TIMINGS /
                 # _resolve_pre_roll_chain above.
                 adjusted_skill, pre_roll_post_hit = _resolve_pre_roll_chain(
-                    entry["skill"], context, PRE_ROLL_SOLO_TIMINGS, battle
+                    entry["skill"], context, PRE_ROLL_SOLO_TIMINGS
                 )
                 first_action_done = True
 
