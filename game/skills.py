@@ -110,7 +110,10 @@ def flip_coin(heads_chance: int = 50) -> bool:
 
 
 def resolve_skill(
-    skill: Skill, heads_chance: int = 50, context: TriggerContext | None = None
+    skill: Skill,
+    heads_chance: int = 50,
+    context: TriggerContext | None = None,
+    extra_coin_timings: tuple[str, ...] = (),
 ) -> SkillResult:
     """Resolves a skill's coins one at a time, in sequence.
 
@@ -124,34 +127,74 @@ def resolve_skill(
     context is optional (attrition rounds inside resolve_round_clash pass
     None, since those tosses never actually deal damage and their
     per-coin triggers would never be applied anyway). When provided,
-    each coin is checked against this skill's per-coin Triggers whose
-    coin_index matches that coin's 1-based position and whose timing is
-    on_hit (always), heads_hit (only if this coin landed heads), or
-    tails_hit (only if it landed tails). Matching, condition-true
-    triggers are attached to that CoinResult.fired_triggers for the
-    caller to apply -- evaluating here (not later) matters because a
-    trigger's condition might depend on state a later coin's own effect
-    changes (e.g. a status this same skill just inflicted).
+    each coin now fires TWO passes of its own per-coin Triggers (matched
+    by coin_index):
+
+      1. [Coin Start], BEFORE this coin is tossed. Its bonus_power/
+         bonus_coin_power effects are applied immediately -- bonus_power
+         adds straight onto the running Power for this coin (and every
+         coin after it, same as a Heads would), bonus_coin_power raises
+         coin_power itself from this coin onward. Any inflict_status/
+         sanity_gain effect on a [Coin Start] trigger is collected into
+         that coin's fired_triggers same as the hit-timings below (a
+         self-buff on use of this specific coin, not gated on it
+         actually landing since it hasn't tossed yet -- but every coin
+         in this engine deals a hit regardless, so this is a moot
+         distinction in practice).
+
+      2. AFTER the toss: [On Hit] (always), [Heads Hit]/[Tails Hit]
+         (gated on that face), [Current Coin Attack End] (always),
+         [Heads Attack End]/[Tails Attack End] (gated on that face),
+         plus whatever's in extra_coin_timings -- currently only
+         [Hit After Clash Win], passed by resolve_round_clash ONLY for
+         the winner's final decisive toss, never for attrition rounds
+         or a solo unopposed attack.
+
+    Matching, condition-true triggers land in that CoinResult.fired_
+    triggers for the caller (apply_incoming_hit in cogs/battle.py) to
+    apply. Evaluating here (not later) matters because a trigger's
+    condition might depend on state a later coin's own effect changes
+    (e.g. a status this same skill just inflicted).
     """
     power = skill.base_power
+    coin_power = skill.coin_power
     results: list[CoinResult] = []
 
     for i in range(skill.coins):
+        coin_index = i + 1
+        fired_triggers: list[Trigger] = []
+
+        if context is not None:
+            coin_start_fired = [
+                t for t in skill.triggers
+                if t.coin_index == coin_index
+                and t.timing == "coin_start"
+                and evaluate_condition(t.condition, context)
+            ]
+            power += sum(t.effect_value for t in coin_start_fired if t.effect_type == "bonus_power")
+            coin_power += sum(t.effect_value for t in coin_start_fired if t.effect_type == "bonus_coin_power")
+            fired_triggers.extend(
+                t for t in coin_start_fired if t.effect_type in ("inflict_status", "sanity_gain")
+            )
+
         heads = flip_coin(heads_chance)
         if heads:
-            power += skill.coin_power
+            power += coin_power
 
-        fired_triggers: list[Trigger] = []
         if context is not None:
-            coin_index = i + 1
+            post_toss_timings = (
+                "on_hit", "heads_hit", "tails_hit",
+                "current_coin_attack_end", "heads_attack_end", "tails_attack_end",
+                *extra_coin_timings,
+            )
             for t in skill.triggers:
-                if t.coin_index != coin_index:
+                if t.coin_index != coin_index or t.timing not in post_toss_timings:
                     continue
-                if t.timing == "heads_hit" and not heads:
+                if t.timing in ("heads_hit", "heads_attack_end") and not heads:
                     continue
-                if t.timing == "tails_hit" and heads:
+                if t.timing in ("tails_hit", "tails_attack_end") and heads:
                     continue
-                if t.timing not in ("on_hit", "heads_hit", "tails_hit"):
+                if t.effect_type not in ("inflict_status", "sanity_gain"):
                     continue
                 if evaluate_condition(t.condition, context):
                     fired_triggers.append(t)
@@ -320,6 +363,17 @@ class ClashOutcome:
     rounds: list[ClashRound]
     winner_final_result: SkillResult
 
+    # [Before Attack] triggers that fired for the winner specifically,
+    # right before their final decisive toss (see resolve_round_clash
+    # below for why this is separate from the general pre-roll chain
+    # that runs before attrition even starts). Only inflict_status/
+    # sanity_gain effects show up here -- bonus_power/bonus_coin_power
+    # are already baked into winner_final_result by the time this is
+    # populated, same pattern as every other post_hit list in this
+    # engine. The caller (cogs/battle.py combat()) applies these
+    # alongside clash_win/attack_end.
+    winner_before_attack_post_hit: list[Trigger] = field(default_factory=list)
+
     def total_damage(self) -> int:
         return self.winner_final_result.total_damage
 
@@ -366,6 +420,19 @@ def resolve_round_clash(
     toss, since that's the only toss whose fired_triggers actually
     matter to the caller.
 
+    [Before Attack] is evaluated right here, against the winner only,
+    immediately before their final toss -- NOT bundled into whatever
+    pre-roll chain the caller ran before calling this function at all
+    (see PRE_ROLL_CLASH_TIMINGS in cogs/battle.py, which now only
+    covers combat_start/turn_start/before_use/on_use/clash_start).
+    That's the real distinction between [Clash Start] (both sides, the
+    moment the clash begins, before even the attrition rounds) and
+    [Before Attack] (winner only, the moment right before the hit that
+    actually deals damage) -- they used to collapse into the same
+    pre-toss window, which meant a loser's [Before Attack] trigger
+    could fire even though they never land a hit. Now it can't: the
+    loser's skill/context are never touched here.
+
     max_rounds is a safety valve against a true infinite loop (a tie
     every single round forever); hitting it is astronomically unlikely
     with real coin randomness.
@@ -410,6 +477,19 @@ def resolve_round_clash(
     winner_heads_chance = heads_chance_a if winner == "a" else heads_chance_b
     winner_context = context_a if winner == "a" else context_b
 
+    # [Before Attack] fires HERE, for the winner only, right before
+    # their one real damage-dealing toss -- see the docstring above for
+    # why this is deliberately separate from whatever pre-roll chain
+    # the caller already ran on skill_a/skill_b before this function
+    # was even called. bonus_power/bonus_coin_power get baked into
+    # winner_skill immediately via resolve_triggers (affecting only
+    # this final toss, never the attrition rounds already resolved
+    # above), inflict_status/sanity_gain triggers are collected for the
+    # caller to apply.
+    before_attack_post_hit: list[Trigger] = []
+    if winner_context is not None:
+        winner_skill, before_attack_post_hit = resolve_triggers(winner_skill, winner_context, "before_attack")
+
     final_skill = replace(
         winner_skill,
         coins=winner_remaining,
@@ -417,6 +497,17 @@ def resolve_round_clash(
         coin_status_potencies=winner_skill.coin_status_potencies[:winner_remaining],
         coin_status_counts=winner_skill.coin_status_counts[:winner_remaining],
     )
-    final_result = resolve_skill(final_skill, winner_heads_chance, winner_context)
+    # hit_after_clash_win only ever applies to THIS toss -- the winner's
+    # one real damage-dealing toss -- never to the attrition rounds
+    # above (those pass no extra_coin_timings, matching their plain
+    # resolve_skill calls) and never to a solo unopposed attack (that
+    # path in cogs/battle.py calls resolve_skill directly with no
+    # extra_coin_timings either).
+    final_result = resolve_skill(
+        final_skill, winner_heads_chance, winner_context, extra_coin_timings=("hit_after_clash_win",)
+    )
 
-    return ClashOutcome(winner=winner, rounds=rounds, winner_final_result=final_result)
+    return ClashOutcome(
+        winner=winner, rounds=rounds, winner_final_result=final_result,
+        winner_before_attack_post_hit=before_attack_post_hit,
+    )

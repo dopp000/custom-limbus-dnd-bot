@@ -595,20 +595,21 @@ def apply_incoming_hit(
 # it's listed first here for readability even though the actual skip
 # check happens per-call.
 #
-# clash_start and before_attack are both folded into this same
-# pre-toss window rather than being scoped to "only the winner's final
-# decisive toss, not the attrition rounds" -- doing that precisely
-# would mean resolve_round_clash needs an extra hook exposing the
-# moment right before its internal final toss, separate from the
-# attrition tosses that happen with the same skill object beforehand.
-# That's a real restructure, not just a dispatch wire-up, so it's
-# queued separately; for now [Clash Start] and [Before Attack] behave
-# identically to [On Use] in this engine -- all of them apply before
-# ANY coin (attrition or final) gets tossed.
-PRE_ROLL_CLASH_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "clash_start", "before_attack")
+# [Before Attack] is deliberately NOT in this list. It used to be
+# bundled in here alongside [On Use], which meant it fired for BOTH
+# sides before attrition even started -- wrong, since the loser never
+# actually attacks. It's now evaluated inside resolve_round_clash
+# itself, for the winner only, immediately before their final decisive
+# toss (see that function's docstring in game/skills.py). [Clash Start]
+# stays here though: it's genuinely a "the clash begins" moment for
+# both sides, before ANY toss (attrition or final), which is exactly
+# what this pre-roll window represents.
+PRE_ROLL_CLASH_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "clash_start")
 
-# Same idea for a side making an unopposed attack -- no clash_start
-# here since there's no clash to start.
+# Same idea for a side making an unopposed attack. [Before Attack]
+# stays here for the solo path -- there's no attrition to distinguish
+# it from, the single toss IS the attack, so firing it at the same
+# pre-roll moment as [On Use] is already correct.
 PRE_ROLL_SOLO_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "before_attack")
 
 
@@ -1282,7 +1283,8 @@ class BattleCog(commands.GroupCog, name="battle"):
                 loser.take_damage(total_damage)
                 trigger_log = apply_trigger_effects(
                     winner_pre_roll_post_hit + clash_win_post_hit + attack_end_post_hit
-                    + turn_end_post_hit_winner + per_coin_triggers,
+                    + turn_end_post_hit_winner + per_coin_triggers
+                    + outcome.winner_before_attack_post_hit,
                     winner, loser,
                 )
                 trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
