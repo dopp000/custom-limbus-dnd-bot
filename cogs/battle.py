@@ -7,7 +7,7 @@ from game.battle import (
     SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
-from game.conditions import Trigger, TriggerContext, parse_trigger_input
+from game.conditions import Trigger, TriggerContext, parse_trigger_text, TriggerParseError
 from game.colors import get_status_color
 from game.character import load_character
 from game.statuses import StatusInstance, decay_after_trigger, apply_status, INFLICTABLE_STATUSES
@@ -86,7 +86,86 @@ def _skill_preview_text(skill: Skill) -> str:
             for t in skill.triggers
         )
         text += f"\n{trigger_lines}"
+    if skill.tags:
+        text += f"\n  Flags: {', '.join(sorted(skill.tags))}"
     return text
+
+
+class AddSkillTriggerModal(discord.ui.Modal, title="Skill Triggers"):
+    """The locked-in modal popup for /battle addskill: one multi-line
+    paste box for Conditional Triggers, in the real bracket-tag syntax
+    parse_trigger_text expects (one line per Trigger or skill-flag tag),
+    instead of the old flat 'condition|effect|hint:N' pipe format.
+
+    All the OTHER skill fields (name, base_power, coin_power, coins,
+    damage_type, status_input) are already validated by the time this
+    modal is shown -- addskill collects those as normal slash-command
+    params first, then opens this to collect just the trigger block,
+    since that's the one field too long and structured for a single
+    slash-command text option.
+    """
+
+    triggers_input = discord.ui.TextInput(
+        label="Triggers (one per line, blank for none)",
+        style=discord.TextStyle.paragraph,
+        placeholder=(
+            "[On Use] If this unit's Sanity is 45+, Coin Power +1\n"
+            ":Coin1: [On Hit] Inflict 2 Rupture Potency, 1 Count\n"
+            "[Target Fixed]"
+        ),
+        required=False,
+        max_length=4000,
+    )
+
+    def __init__(
+        self,
+        target_fighter: Fighter,
+        skill_name: str,
+        base_power: int,
+        coin_power: int,
+        coins: int,
+        damage_type: str,
+        coin_statuses: list[str | None],
+        coin_status_potencies: list[int],
+        coin_status_counts: list[int],
+    ):
+        super().__init__()
+        self.target_fighter = target_fighter
+        self.skill_name = skill_name
+        self.base_power = base_power
+        self.coin_power = coin_power
+        self.coins = coins
+        self.damage_type = damage_type
+        self.coin_statuses = coin_statuses
+        self.coin_status_potencies = coin_status_potencies
+        self.coin_status_counts = coin_status_counts
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            triggers, flags = parse_trigger_text(self.triggers_input.value or "")
+        except TriggerParseError as e:
+            await interaction.response.send_message(
+                f"Trigger line error on `{e.line.strip()}`: {e.reason}",
+                ephemeral=True,
+            )
+            return
+
+        skill = Skill(
+            name=self.skill_name,
+            base_power=self.base_power,
+            coin_power=self.coin_power,
+            coins=self.coins,
+            damage_type=self.damage_type,
+            coin_statuses=self.coin_statuses,
+            coin_status_potencies=self.coin_status_potencies,
+            coin_status_counts=self.coin_status_counts,
+            triggers=triggers,
+            tags=flags,
+        )
+
+        preview_text = f"{self.target_fighter.name} would learn {self.skill_name}\n" + _skill_preview_text(skill)
+        view = SkillConfirmView(self.target_fighter, skill, preview_text)
+        await interaction.response.send_message(preview_text, view=view, ephemeral=True)
 
 
 class ClashDeclareView(discord.ui.View):
@@ -447,11 +526,23 @@ async def sync_battle_message(bot: commands.Bot, battle: Battle):
     await message.edit(embed=build_battle_embed(battle))
 
 
-def apply_incoming_hit(attacker_skill: Skill, result: SkillResult, target: Fighter) -> tuple[int, list[str]]:
+def apply_incoming_hit(
+    attacker_skill: Skill, result: SkillResult, target: Fighter
+) -> tuple[int, list[str], list[Trigger]]:
+    """Applies each landed coin's damage/status, same as before, and now
+    also collects whichever per-coin Triggers (on_hit/heads_hit/tails_hit)
+    fired on that coin (see CoinResult.fired_triggers), so the caller can
+    hand them to apply_trigger_effects alongside the skill-level ones.
+    `result` here is always the coins that actually landed -- attrition
+    rounds during a clash never reach this function, only the final toss
+    does -- so every coin iterated below is a real hit.
+    """
     log: list[str] = []
     total_damage = 0
+    per_coin_triggers: list[Trigger] = []
 
     for i, coin in enumerate(result.coin_results):
+        per_coin_triggers.extend(coin.fired_triggers)
         raw = coin.damage_dealt
         resisted = apply_resistance(raw, target.resistances.get(attacker_skill.damage_type, 0))
         if resisted != raw:
@@ -495,7 +586,7 @@ def apply_incoming_hit(attacker_skill: Skill, result: SkillResult, target: Fight
 
         total_damage += coin_total
 
-    return total_damage, log
+    return total_damage, log, per_coin_triggers
 
 
 def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter) -> list[str]:
@@ -710,11 +801,6 @@ class BattleCog(commands.GroupCog, name="battle"):
             "Each entry is 'none' or 'Name:Potency:Count'. "
             "Example for 3 coins: none,Rupture:3:2,Bleed:1:1"
         ),
-        trigger_input=(
-            "Conditional Triggers, semicolon-separated, each one "
-            "'condition|effect|hint:N'. 'none' for no triggers. "
-            "Example: target_status:burn:1:0|bonus_power:8|hint:2"
-        ),
     )
     @app_commands.choices(
         damage_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in DAMAGE_TYPES],
@@ -729,7 +815,6 @@ class BattleCog(commands.GroupCog, name="battle"):
         coins: int,
         damage_type: app_commands.Choice[str],
         status_input: str = "none",
-        trigger_input: str = "none",
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -792,32 +877,25 @@ class BattleCog(commands.GroupCog, name="battle"):
             coin_status_potencies.append(potency)
             coin_status_counts.append(count)
 
-        try:
-            triggers = parse_trigger_input(trigger_input)
-        except (ValueError, IndexError) as e:
-            await interaction.response.send_message(
-                f"trigger_input error: {e}\nFormat: 'condition|effect|hint:N', "
-                "multiple triggers separated by ';', or 'none'.",
-                ephemeral=True,
+        # Everything else about the skill is validated -- hand off to the
+        # Trigger modal now, since send_modal has to be the interaction's
+        # first (and only) response. The modal's on_submit does the actual
+        # parse_trigger_text call, builds the Skill (with .tags from
+        # whatever skill-flag lines were pasted), and shows the confirm
+        # preview, all using ITS OWN interaction from the modal submit.
+        await interaction.response.send_modal(
+            AddSkillTriggerModal(
+                target_fighter=target_fighter,
+                skill_name=skill_name,
+                base_power=base_power,
+                coin_power=coin_power,
+                coins=coins,
+                damage_type=damage_type.value,
+                coin_statuses=coin_statuses,
+                coin_status_potencies=coin_status_potencies,
+                coin_status_counts=coin_status_counts,
             )
-            return
-
-        skill = Skill(
-            name=skill_name,
-            base_power=base_power,
-            coin_power=coin_power,
-            coins=coins,
-            damage_type=damage_type.value,
-            coin_statuses=coin_statuses,
-            coin_status_potencies=coin_status_potencies,
-            coin_status_counts=coin_status_counts,
-            triggers=triggers,
         )
-
-        preview_text = f"{target_fighter.name} would learn {skill_name}\n" + _skill_preview_text(skill)
-
-        view = SkillConfirmView(target_fighter, skill, preview_text)
-        await interaction.response.send_message(preview_text, view=view, ephemeral=True)
 
     @app_commands.command(
         name="declare",
@@ -1103,28 +1181,49 @@ class BattleCog(commands.GroupCog, name="battle"):
                     caster=fighter_b, target=fighter_a, battle=battle,
                     is_first_hit_of_round=not first_action_done,
                 )
-                skill_a, post_hit_a = resolve_triggers(entry_a["skill"], context_a)
-                skill_b, post_hit_b = resolve_triggers(entry_b["skill"], context_b)
+                # [On Use] fires for both sides before any coins are
+                # tossed -- this is the only skill-level timing that can
+                # still change the clash math (bonus_power/coin_power),
+                # so it has to happen before resolve_round_clash.
+                skill_a, on_use_post_hit_a = resolve_triggers(entry_a["skill"], context_a, "on_use")
+                skill_b, on_use_post_hit_b = resolve_triggers(entry_b["skill"], context_b, "on_use")
                 first_action_done = True
 
                 outcome = resolve_round_clash(
                     skill_a, skill_b,
                     heads_chance_a=fighter_a.heads_chance(),
                     heads_chance_b=fighter_b.heads_chance(),
+                    context_a=context_a,
+                    context_b=context_b,
                 )
                 winner = fighter_a if outcome.winner == "a" else fighter_b
                 loser = fighter_b if winner is fighter_a else fighter_a
                 winner_skill = skill_a if outcome.winner == "a" else skill_b
-                winner_post_hit = post_hit_a if outcome.winner == "a" else post_hit_b
+                loser_skill = skill_b if outcome.winner == "a" else skill_a
+                winner_context = context_a if outcome.winner == "a" else context_b
+                loser_context = context_b if outcome.winner == "a" else context_a
+                winner_on_use_post_hit = on_use_post_hit_a if outcome.winner == "a" else on_use_post_hit_b
 
                 winner.gain_sanity(SANITY_CLASH_WIN)
                 loser.lose_sanity(SANITY_CLASH_LOSS)
 
-                total_damage, status_log = apply_incoming_hit(
+                # [Clash Win] only fires for the winner, [Clash Lose] only
+                # for the loser -- the loser never actually hits, so its
+                # Triggers only make sense at a "lose" timing, never at
+                # "on_hit"/"clash_win" ones (those simply never fire for
+                # it, since resolve_triggers here is only ever called
+                # with the loser's own skill+context at "clash_lose").
+                _, clash_win_post_hit = resolve_triggers(winner_skill, winner_context, "clash_win")
+                _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
+
+                total_damage, status_log, per_coin_triggers = apply_incoming_hit(
                     winner_skill, outcome.winner_final_result, loser
                 )
                 loser.take_damage(total_damage)
-                trigger_log = apply_trigger_effects(winner_post_hit, winner, loser)
+                trigger_log = apply_trigger_effects(
+                    winner_on_use_post_hit + clash_win_post_hit + per_coin_triggers, winner, loser
+                )
+                trigger_log += apply_trigger_effects(clash_lose_post_hit, loser, winner)
 
                 field_value = format_clash_rounds(outcome, fighter_a.name, fighter_b.name)
                 field_value += (
@@ -1163,17 +1262,20 @@ class BattleCog(commands.GroupCog, name="battle"):
                     caster=fighter, target=target, battle=battle,
                     is_first_hit_of_round=not first_action_done,
                 )
-                adjusted_skill, post_hit = resolve_triggers(entry["skill"], context)
+                adjusted_skill, on_use_post_hit = resolve_triggers(entry["skill"], context, "on_use")
                 first_action_done = True
 
-                result = resolve_skill(adjusted_skill, fighter.heads_chance())
+                result = resolve_skill(adjusted_skill, fighter.heads_chance(), context)
                 heads_landed = sum(1 for c in result.coin_results if c.heads)
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log = apply_incoming_hit(adjusted_skill, result, target)
+                total_damage, status_log, per_coin_triggers = apply_incoming_hit(adjusted_skill, result, target)
                 target.take_damage(total_damage)
-                trigger_log = apply_trigger_effects(post_hit, fighter, target)
+                _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
+                trigger_log = apply_trigger_effects(
+                    on_use_post_hit + unopposed_post_hit + per_coin_triggers, fighter, target
+                )
 
                 field_value = format_skill_result(result)
                 field_value += (

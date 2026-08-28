@@ -32,6 +32,13 @@ class Skill:
     # within a single resolution.
     triggers: list[Trigger] = field(default_factory=list)
 
+    # Skill-level metadata flags parsed alongside triggers (target_fixed,
+    # unclashable, indiscriminate, clashable_counter). These aren't
+    # Conditional Triggers themselves -- no condition, no effect, no
+    # timing -- just static properties of the skill that other systems
+    # (declare/clash targeting, etc.) check directly off the Skill.
+    tags: set[str] = field(default_factory=set)
+
     def __post_init__(self):
         # Pads status lists up to `coins` entries if a Skill gets built
         # without explicitly passing them (quick construction, tests),
@@ -51,6 +58,13 @@ class CoinResult:
     heads: bool
     power_after: int
     damage_dealt: int
+
+    # Per-coin Triggers (on_hit / heads_hit / tails_hit, matched by
+    # coin_index) that fired on this specific coin, already filtered to
+    # ones whose condition evaluated true. The caller (apply_incoming_hit
+    # in cogs/battle.py) is responsible for actually applying their
+    # effects, same as skill-level post_hit triggers from resolve_triggers.
+    fired_triggers: list[Trigger] = field(default_factory=list)
 
 
 @dataclass
@@ -95,7 +109,9 @@ def flip_coin(heads_chance: int = 50) -> bool:
     return roll <= heads_chance
 
 
-def resolve_skill(skill: Skill, heads_chance: int = 50) -> SkillResult:
+def resolve_skill(
+    skill: Skill, heads_chance: int = 50, context: TriggerContext | None = None
+) -> SkillResult:
     """Resolves a skill's coins one at a time, in sequence.
 
     Every coin lands a hit at whatever Power has been built up so far.
@@ -104,21 +120,57 @@ def resolve_skill(skill: Skill, heads_chance: int = 50) -> SkillResult:
 
     heads_chance is this skill's OWN caster's Sanity-driven odds (see
     Fighter.heads_chance in game/battle.py), defaulting to a fair 50/50.
+
+    context is optional (attrition rounds inside resolve_round_clash pass
+    None, since those tosses never actually deal damage and their
+    per-coin triggers would never be applied anyway). When provided,
+    each coin is checked against this skill's per-coin Triggers whose
+    coin_index matches that coin's 1-based position and whose timing is
+    on_hit (always), heads_hit (only if this coin landed heads), or
+    tails_hit (only if it landed tails). Matching, condition-true
+    triggers are attached to that CoinResult.fired_triggers for the
+    caller to apply -- evaluating here (not later) matters because a
+    trigger's condition might depend on state a later coin's own effect
+    changes (e.g. a status this same skill just inflicted).
     """
     power = skill.base_power
     results: list[CoinResult] = []
 
-    for _ in range(skill.coins):
+    for i in range(skill.coins):
         heads = flip_coin(heads_chance)
         if heads:
             power += skill.coin_power
-        results.append(CoinResult(heads=heads, power_after=power, damage_dealt=power))
+
+        fired_triggers: list[Trigger] = []
+        if context is not None:
+            coin_index = i + 1
+            for t in skill.triggers:
+                if t.coin_index != coin_index:
+                    continue
+                if t.timing == "heads_hit" and not heads:
+                    continue
+                if t.timing == "tails_hit" and heads:
+                    continue
+                if t.timing not in ("on_hit", "heads_hit", "tails_hit"):
+                    continue
+                if evaluate_condition(t.condition, context):
+                    fired_triggers.append(t)
+
+        results.append(CoinResult(
+            heads=heads, power_after=power, damage_dealt=power, fired_triggers=fired_triggers
+        ))
 
     return SkillResult(skill=skill, coin_results=results)
 
 
-def resolve_triggers(skill: Skill, context: TriggerContext) -> tuple[Skill, list[Trigger]]:
-    """Evaluates every trigger on a skill against the current context.
+def resolve_triggers(
+    skill: Skill, context: TriggerContext, timing: str
+) -> tuple[Skill, list[Trigger]]:
+    """Evaluates every skill-level trigger matching `timing` against the
+    current context. Per-coin timings (on_hit/heads_hit/tails_hit/etc.)
+    are never handled here -- those only ever fire from inside
+    resolve_skill, one coin at a time, since they need to know that
+    coin's own heads/tails result.
 
     Pre-roll effects (bonus_power, bonus_coin_power) are baked into a
     modified copy of the skill immediately, since they have to apply
@@ -132,7 +184,10 @@ def resolve_triggers(skill: Skill, context: TriggerContext) -> tuple[Skill, list
     though its pre-roll bonuses still legitimately affected the clash
     math.
     """
-    fired = [t for t in skill.triggers if evaluate_condition(t.condition, context)]
+    fired = [
+        t for t in skill.triggers
+        if t.timing == timing and evaluate_condition(t.condition, context)
+    ]
 
     bonus_power = sum(t.effect_value for t in fired if t.effect_type == "bonus_power")
     bonus_coin_power = sum(t.effect_value for t in fired if t.effect_type == "bonus_coin_power")
@@ -274,6 +329,8 @@ def resolve_round_clash(
     skill_b: Skill,
     heads_chance_a: int = 50,
     heads_chance_b: int = 50,
+    context_a: TriggerContext | None = None,
+    context_b: TriggerContext | None = None,
     max_rounds: int = 100,
 ) -> ClashOutcome:
     """Resolves a clash via round-by-round coin attrition.
@@ -301,6 +358,14 @@ def resolve_round_clash(
     (Fighter.heads_chance()), applied to every toss on that side, both
     during attrition and on the final damage toss.
 
+    context_a/context_b are each side's TriggerContext, passed through
+    to resolve_skill so per-coin triggers can be evaluated. They're
+    threaded through the attrition-round tosses too (harmless, those
+    tosses never actually apply damage or fired_triggers), and the
+    winner's own context is the one carried into their final decisive
+    toss, since that's the only toss whose fired_triggers actually
+    matter to the caller.
+
     max_rounds is a safety valve against a true infinite loop (a tie
     every single round forever); hitting it is astronomically unlikely
     with real coin randomness.
@@ -321,8 +386,8 @@ def resolve_round_clash(
         before_a, before_b = coins_a, coins_b
         temp_a = replace(skill_a, coins=coins_a)
         temp_b = replace(skill_b, coins=coins_b)
-        result_a = resolve_skill(temp_a, heads_chance_a)
-        result_b = resolve_skill(temp_b, heads_chance_b)
+        result_a = resolve_skill(temp_a, heads_chance_a, context_a)
+        result_b = resolve_skill(temp_b, heads_chance_b, context_b)
 
         if result_a.final_power > result_b.final_power:
             loser = "b"
@@ -343,6 +408,7 @@ def resolve_round_clash(
     winner_skill = skill_a if winner == "a" else skill_b
     winner_remaining = coins_a if winner == "a" else coins_b
     winner_heads_chance = heads_chance_a if winner == "a" else heads_chance_b
+    winner_context = context_a if winner == "a" else context_b
 
     final_skill = replace(
         winner_skill,
@@ -351,6 +417,6 @@ def resolve_round_clash(
         coin_status_potencies=winner_skill.coin_status_potencies[:winner_remaining],
         coin_status_counts=winner_skill.coin_status_counts[:winner_remaining],
     )
-    final_result = resolve_skill(final_skill, winner_heads_chance)
+    final_result = resolve_skill(final_skill, winner_heads_chance, winner_context)
 
     return ClashOutcome(winner=winner, rounds=rounds, winner_final_result=final_result)
