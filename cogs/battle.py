@@ -527,7 +527,7 @@ async def sync_battle_message(bot: commands.Bot, battle: Battle):
 
 
 def apply_incoming_hit(
-    attacker_skill: Skill, result: SkillResult, target: Fighter
+    attacker_skill: Skill, result: SkillResult, target: Fighter, caster: Fighter
 ) -> tuple[int, list[str], list[Trigger]]:
     """Applies each landed coin's damage/status, same as before, and now
     also collects whichever per-coin Triggers (on_hit/heads_hit/tails_hit)
@@ -536,14 +536,24 @@ def apply_incoming_hit(
     `result` here is always the coins that actually landed -- attrition
     rounds during a clash never reach this function, only the final toss
     does -- so every coin iterated below is a real hit.
+
+    `caster` is new: needed so a Crit coin (see CoinResult.is_crit) can
+    actually consume 1 count off the caster's real Poise stack here --
+    resolve_skill only computed is_crit against a local copy, it never
+    touches the Fighter object (see its docstring in game/skills.py).
+    Crit bonus damage is folded into the SAME resistance check as the
+    coin's normal damage (it's still a hit of that skill's damage_type,
+    just a harder one), unlike Rupture's bonus below, which is the
+    TARGET's own reaction and deliberately bypasses resistance entirely.
     """
     log: list[str] = []
     total_damage = 0
     per_coin_triggers: list[Trigger] = []
+    poise = caster.get_status("poise")
 
     for i, coin in enumerate(result.coin_results):
         per_coin_triggers.extend(coin.fired_triggers)
-        raw = coin.damage_dealt
+        raw = coin.damage_dealt + (coin.crit_bonus_damage if coin.is_crit else 0)
         resisted = apply_resistance(raw, target.resistances.get(attacker_skill.damage_type, 0))
         if resisted != raw:
             log.append(
@@ -551,6 +561,15 @@ def apply_incoming_hit(
                 f"{attacker_skill.damage_type.capitalize()} resistance: {raw} -> {resisted})"
             )
         coin_total = resisted
+
+        if coin.is_crit:
+            log.append(
+                f"Coin {i + 1}: {status_emoji('poise')} Crit! {caster.name}'s Poise adds "
+                f"+{coin.crit_bonus_damage} damage."
+            )
+            if poise is not None:
+                poise = decay_after_trigger(poise)
+                caster.set_status_instance(poise)
 
         decayed_rupture = None
         rupture = target.get_status("rupture")
@@ -1355,7 +1374,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
                 total_damage, status_log, per_coin_triggers = apply_incoming_hit(
-                    winner_skill, outcome.winner_final_result, loser
+                    winner_skill, outcome.winner_final_result, loser, winner
                 )
                 loser.take_damage(total_damage)
                 trigger_log = apply_trigger_effects(
@@ -1416,7 +1435,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log, per_coin_triggers = apply_incoming_hit(adjusted_skill, result, target)
+                total_damage, status_log, per_coin_triggers = apply_incoming_hit(adjusted_skill, result, target, fighter)
                 target.take_damage(total_damage)
                 _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
                 _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")

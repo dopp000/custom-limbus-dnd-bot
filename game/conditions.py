@@ -46,6 +46,14 @@ PER_COIN_TIMINGS = {
     "current coin attack end": "current_coin_attack_end",
     "heads attack end": "heads_attack_end",
     "tails attack end": "tails_attack_end",
+    # A coin Crits if the caster is currently holding Poise (see the
+    # Poise-break rule documented on resolve_skill in game/skills.py) --
+    # independent of that coin's own face, which is why [On Crit -
+    # Heads Hit]/[On Crit - Tails Hit] exist as their own sub-timings
+    # rather than being implied by [Heads Hit]/[Tails Hit].
+    "on crit": "on_crit",
+    "on crit - heads hit": "on_crit_heads_hit",
+    "on crit - tails hit": "on_crit_tails_hit",
 }
 
 # Recognized by name, but nothing in the engine backs them yet. Parsed so
@@ -53,13 +61,11 @@ PER_COIN_TIMINGS = {
 # a generic "unknown tag".
 UNSUPPORTED_TIMINGS = {
     "before getting hit": "no Counter-skill system built yet",
-    "on crit": "no Critical Hit / Poise-crit system built yet",
-    "on crit - heads hit": "no Critical Hit / Poise-crit system built yet",
-    "on crit - tails hit": "no Critical Hit / Poise-crit system built yet",
     "on evade": "no Evade-skill system built yet",
 }
 
 ALL_TIMING_LOOKUP = {**SKILL_LEVEL_TIMINGS, **PER_COIN_TIMINGS}
+
 
 # Bracket tags that are plain skill metadata (no condition, no effect,
 # just a flag), stored on Skill.tags instead of becoming a Trigger.

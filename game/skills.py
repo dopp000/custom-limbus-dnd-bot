@@ -66,6 +66,19 @@ class CoinResult:
     # effects, same as skill-level post_hit triggers from resolve_triggers.
     fired_triggers: list[Trigger] = field(default_factory=list)
 
+    # True if this coin Crit -- the caster held Poise (count > 0) at the
+    # moment this coin resolved, independent of Heads/Tails (see the
+    # Poise-break rule on resolve_skill below). crit_bonus_damage is the
+    # extra damage that Crit deals (equal to the caster's Poise potency
+    # at that moment), computed here but NOT yet added into damage_dealt
+    # above -- same pattern as Rupture's bonus damage, which also isn't
+    # baked into a coin's own damage_dealt, it's added by the caller
+    # (apply_incoming_hit in cogs/battle.py) at hit-application time,
+    # since that's also where the caster's real Poise stack actually
+    # gets consumed (skills.py never mutates a Fighter).
+    is_crit: bool = False
+    crit_bonus_damage: int = 0
+
 
 @dataclass
 class SkillResult:
@@ -155,10 +168,33 @@ def resolve_skill(
     apply. Evaluating here (not later) matters because a trigger's
     condition might depend on state a later coin's own effect changes
     (e.g. a status this same skill just inflicted).
+
+    Poise-break / Crit rule: if context is given and context.caster
+    currently holds Poise (a StatusInstance with count > 0 -- see
+    SELF_BUFF_STATUSES in game/conditions.py), each coin in this
+    resolution checks that stack IN ORDER: as long as count remains,
+    that coin Crits, consuming exactly 1 count and dealing bonus damage
+    equal to Poise's potency (read fresh at the start of this call, not
+    re-read from the Fighter mid-resolution, since skills.py never
+    mutates a Fighter -- the real consumption happens in
+    apply_incoming_hit, which trusts these per-coin is_crit flags to
+    know how many counts to actually decay off the caster afterward).
+    A Crit is independent of that coin's own face -- [On Crit] fires on
+    ANY crit, [On Crit - Heads Hit]/[On Crit - Tails Hit] additionally
+    gate on which face it landed on, mirroring how [Heads Hit]/[Tails
+    Hit] relate to [On Hit].
     """
     power = skill.base_power
     coin_power = skill.coin_power
     results: list[CoinResult] = []
+
+    poise_remaining = 0
+    poise_potency = 0
+    if context is not None and context.caster is not None:
+        poise = context.caster.get_status("poise")
+        if poise is not None:
+            poise_remaining = poise.count
+            poise_potency = poise.potency
 
     for i in range(skill.coins):
         coin_index = i + 1
@@ -181,10 +217,18 @@ def resolve_skill(
         if heads:
             power += coin_power
 
+        is_crit = False
+        crit_bonus_damage = 0
+        if poise_remaining > 0:
+            is_crit = True
+            crit_bonus_damage = poise_potency
+            poise_remaining -= 1
+
         if context is not None:
             post_toss_timings = (
                 "on_hit", "heads_hit", "tails_hit",
                 "current_coin_attack_end", "heads_attack_end", "tails_attack_end",
+                "on_crit", "on_crit_heads_hit", "on_crit_tails_hit",
                 *extra_coin_timings,
             )
             for t in skill.triggers:
@@ -194,13 +238,20 @@ def resolve_skill(
                     continue
                 if t.timing in ("tails_hit", "tails_attack_end") and heads:
                     continue
+                if t.timing in ("on_crit", "on_crit_heads_hit", "on_crit_tails_hit") and not is_crit:
+                    continue
+                if t.timing == "on_crit_heads_hit" and not heads:
+                    continue
+                if t.timing == "on_crit_tails_hit" and heads:
+                    continue
                 if t.effect_type not in ("inflict_status", "sanity_gain"):
                     continue
                 if evaluate_condition(t.condition, context):
                     fired_triggers.append(t)
 
         results.append(CoinResult(
-            heads=heads, power_after=power, damage_dealt=power, fired_triggers=fired_triggers
+            heads=heads, power_after=power, damage_dealt=power, fired_triggers=fired_triggers,
+            is_crit=is_crit, crit_bonus_damage=crit_bonus_damage,
         ))
 
     return SkillResult(skill=skill, coin_results=results)
