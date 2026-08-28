@@ -589,6 +589,57 @@ def apply_incoming_hit(
     return total_damage, log, per_coin_triggers
 
 
+# Every pre-roll (pre-toss) skill-level timing, in firing order, for a
+# side that's about to enter a Clash. combat_start is handled specially
+# (skipped once battle.started) by _resolve_pre_roll_chain below, so
+# it's listed first here for readability even though the actual skip
+# check happens per-call.
+#
+# clash_start and before_attack are both folded into this same
+# pre-toss window rather than being scoped to "only the winner's final
+# decisive toss, not the attrition rounds" -- doing that precisely
+# would mean resolve_round_clash needs an extra hook exposing the
+# moment right before its internal final toss, separate from the
+# attrition tosses that happen with the same skill object beforehand.
+# That's a real restructure, not just a dispatch wire-up, so it's
+# queued separately; for now [Clash Start] and [Before Attack] behave
+# identically to [On Use] in this engine -- all of them apply before
+# ANY coin (attrition or final) gets tossed.
+PRE_ROLL_CLASH_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "clash_start", "before_attack")
+
+# Same idea for a side making an unopposed attack -- no clash_start
+# here since there's no clash to start.
+PRE_ROLL_SOLO_TIMINGS = ("combat_start", "turn_start", "before_use", "on_use", "before_attack")
+
+
+def _resolve_pre_roll_chain(
+    skill: Skill, context: TriggerContext, timings: tuple[str, ...], battle: Battle
+) -> tuple[Skill, list[Trigger]]:
+    """Chains resolve_triggers across every pre-roll timing in `timings`,
+    in order, folding each stage's bonus_power/bonus_coin_power into the
+    skill before the next stage evaluates against it (so e.g. a [Turn
+    Start] Power buff is visible to [On Use]'s own condition check), and
+    merging every stage's post-hit triggers into one list for the caller
+    to apply once the hit actually lands.
+
+    combat_start is silently skipped once battle.started is True (see
+    the comment where that flag gets set in combat()), so it only ever
+    fires during a battle's first Combat Phase. turn_start reuses that
+    same "only fires for whatever skill is actually declared this
+    round" restriction -- see the module-level note on [Combat Start]
+    dispatch for why (no persistent Fighter-level buff store exists yet
+    to let it apply to a skill that ISN'T the one being used this turn,
+    that's a bigger addition queued separately).
+    """
+    post_hit: list[Trigger] = []
+    for timing in timings:
+        if timing == "combat_start" and battle.started:
+            continue
+        skill, fired = resolve_triggers(skill, context, timing)
+        post_hit.extend(fired)
+    return skill, post_hit
+
+
 def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter) -> list[str]:
     """Applies the post-hit effects (inflict_status, sanity_gain) from
     whichever triggers fired AND actually landed a hit. Pre-roll effects
@@ -1181,12 +1232,16 @@ class BattleCog(commands.GroupCog, name="battle"):
                     caster=fighter_b, target=fighter_a, battle=battle,
                     is_first_hit_of_round=not first_action_done,
                 )
-                # [On Use] fires for both sides before any coins are
-                # tossed -- this is the only skill-level timing that can
-                # still change the clash math (bonus_power/coin_power),
-                # so it has to happen before resolve_round_clash.
-                skill_a, on_use_post_hit_a = resolve_triggers(entry_a["skill"], context_a, "on_use")
-                skill_b, on_use_post_hit_b = resolve_triggers(entry_b["skill"], context_b, "on_use")
+                # Full pre-roll chain for both sides -- see
+                # PRE_ROLL_CLASH_TIMINGS / _resolve_pre_roll_chain above
+                # for firing order and the documented [Clash Start] /
+                # [Before Attack] scope collapse.
+                skill_a, pre_roll_post_hit_a = _resolve_pre_roll_chain(
+                    entry_a["skill"], context_a, PRE_ROLL_CLASH_TIMINGS, battle
+                )
+                skill_b, pre_roll_post_hit_b = _resolve_pre_roll_chain(
+                    entry_b["skill"], context_b, PRE_ROLL_CLASH_TIMINGS, battle
+                )
                 first_action_done = True
 
                 outcome = resolve_round_clash(
@@ -1202,28 +1257,35 @@ class BattleCog(commands.GroupCog, name="battle"):
                 loser_skill = skill_b if outcome.winner == "a" else skill_a
                 winner_context = context_a if outcome.winner == "a" else context_b
                 loser_context = context_b if outcome.winner == "a" else context_a
-                winner_on_use_post_hit = on_use_post_hit_a if outcome.winner == "a" else on_use_post_hit_b
+                winner_pre_roll_post_hit = pre_roll_post_hit_a if outcome.winner == "a" else pre_roll_post_hit_b
 
                 winner.gain_sanity(SANITY_CLASH_WIN)
                 loser.lose_sanity(SANITY_CLASH_LOSS)
 
-                # [Clash Win] only fires for the winner, [Clash Lose] only
-                # for the loser -- the loser never actually hits, so its
-                # Triggers only make sense at a "lose" timing, never at
-                # "on_hit"/"clash_win" ones (those simply never fire for
-                # it, since resolve_triggers here is only ever called
+                # [Clash Win] and [Attack End] only fire for the winner --
+                # the loser never actually lands a hit, so neither an
+                # on-hit-family Trigger nor an "attack end" one makes
+                # sense for them (resolve_triggers is only ever called
                 # with the loser's own skill+context at "clash_lose").
+                # [Turn End] is different: it fires for BOTH sides, since
+                # it's about that fighter's own turn ending, not about
+                # whether they landed a hit.
                 _, clash_win_post_hit = resolve_triggers(winner_skill, winner_context, "clash_win")
+                _, attack_end_post_hit = resolve_triggers(winner_skill, winner_context, "attack_end")
+                _, turn_end_post_hit_winner = resolve_triggers(winner_skill, winner_context, "turn_end")
                 _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
+                _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
                 total_damage, status_log, per_coin_triggers = apply_incoming_hit(
                     winner_skill, outcome.winner_final_result, loser
                 )
                 loser.take_damage(total_damage)
                 trigger_log = apply_trigger_effects(
-                    winner_on_use_post_hit + clash_win_post_hit + per_coin_triggers, winner, loser
+                    winner_pre_roll_post_hit + clash_win_post_hit + attack_end_post_hit
+                    + turn_end_post_hit_winner + per_coin_triggers,
+                    winner, loser,
                 )
-                trigger_log += apply_trigger_effects(clash_lose_post_hit, loser, winner)
+                trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
 
                 field_value = format_clash_rounds(outcome, fighter_a.name, fighter_b.name)
                 field_value += (
@@ -1262,7 +1324,12 @@ class BattleCog(commands.GroupCog, name="battle"):
                     caster=fighter, target=target, battle=battle,
                     is_first_hit_of_round=not first_action_done,
                 )
-                adjusted_skill, on_use_post_hit = resolve_triggers(entry["skill"], context, "on_use")
+
+                # Full pre-roll chain -- see PRE_ROLL_SOLO_TIMINGS /
+                # _resolve_pre_roll_chain above.
+                adjusted_skill, pre_roll_post_hit = _resolve_pre_roll_chain(
+                    entry["skill"], context, PRE_ROLL_SOLO_TIMINGS, battle
+                )
                 first_action_done = True
 
                 result = resolve_skill(adjusted_skill, fighter.heads_chance(), context)
@@ -1273,8 +1340,12 @@ class BattleCog(commands.GroupCog, name="battle"):
                 total_damage, status_log, per_coin_triggers = apply_incoming_hit(adjusted_skill, result, target)
                 target.take_damage(total_damage)
                 _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
+                _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
+                _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
                 trigger_log = apply_trigger_effects(
-                    on_use_post_hit + unopposed_post_hit + per_coin_triggers, fighter, target
+                    pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
+                    + turn_end_post_hit + per_coin_triggers,
+                    fighter, target,
                 )
 
                 field_value = format_skill_result(result)
@@ -1297,6 +1368,12 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         if truncated:
             embed.set_footer(text="Some actions this round were too numerous to display and were skipped.")
+
+        # Whatever [Combat Start] triggers were going to fire this battle
+        # already fired above (or didn't, if nobody had one declared) --
+        # this flips permanently so they never fire again in later rounds
+        # of the same battle.
+        battle.started = True
 
         battle.start_new_round()
         await interaction.response.send_message(embed=embed)
