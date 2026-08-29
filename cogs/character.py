@@ -75,7 +75,7 @@ class CharacterCog(commands.GroupCog, name="character"):
     @app_commands.command(name="create", description="Create a new character")
     @app_commands.describe(
         name="Character name",
-        avatar="Character avatar image (optional)",
+        avatar="Character avatar image",
     )
     async def create(
         self,
@@ -142,16 +142,15 @@ class CharacterCog(commands.GroupCog, name="character"):
         embed = build_character_embed(character, owner_name)
         await interaction.response.send_message(embed=embed, ephemeral=not public)
 
-    @app_commands.command(name="edit", description="Edit one of your characters")
+    @app_commands.command(name="edit", description="Edit one of your characters (only fill in the fields you want to change)")
     @app_commands.describe(
         name="Character to edit",
-        new_name="Rename the character (optional)",
-        avatar="New avatar image (optional)",
-        hp="New max HP, also heals to full (optional)",
-        speed="New flat Speed, only used if speed_min isn't also set (optional)",
-        speed_min="Lowest a skill slot's Speed can roll each round (optional, sets a range instead of a flat Speed)",
-        speed_max="Highest a skill slot's Speed can roll each round (optional, defaults to speed_min if omitted)",
-        power="New Power (optional)",
+        new_name="Rename the character",
+        avatar="New avatar image",
+        hp="New max HP, also heals to full",
+        speed_min="Lowest a skill slot's Speed can roll each round (needs speed_max too)",
+        speed_max="Highest a skill slot's Speed can roll each round (needs speed_min too)",
+        power="New Power",
     )
     async def edit(
         self,
@@ -160,7 +159,6 @@ class CharacterCog(commands.GroupCog, name="character"):
         new_name: str | None = None,
         avatar: discord.Attachment | None = None,
         hp: int | None = None,
-        speed: int | None = None,
         speed_min: int | None = None,
         speed_max: int | None = None,
         power: int | None = None,
@@ -177,9 +175,9 @@ class CharacterCog(commands.GroupCog, name="character"):
             )
             return
 
-        if speed_max is not None and speed_min is None:
+        if (speed_min is None) != (speed_max is None):
             await interaction.response.send_message(
-                "speed_max needs speed_min too (provide both, or just speed_min alone for a flat value).",
+                "speed_min and speed_max must be set together -- provide both, or neither.",
                 ephemeral=True,
             )
             return
@@ -205,13 +203,9 @@ class CharacterCog(commands.GroupCog, name="character"):
             character.max_hp = hp
             changes.append(f"HP -> {hp}")
 
-        if speed is not None:
-            character.speed = speed
-            changes.append(f"Speed -> {speed}")
-
         if speed_min is not None:
             character.speed_min = speed_min
-            character.speed_max = speed_max if speed_max is not None else speed_min
+            character.speed_max = speed_max
             changes.append(f"Speed range -> {character.speed_min}-{character.speed_max}")
 
         if power is not None:
@@ -229,21 +223,22 @@ class CharacterCog(commands.GroupCog, name="character"):
             f"Updated {character.name}: {', '.join(changes)}.", ephemeral=True
         )
 
-    @app_commands.command(name="resistance", description="Set one of a character's resistances")
+    @app_commands.command(
+        name="resistance",
+        description="Set one or more of a character's resistances",
+    )
     @app_commands.describe(
         name="Character name",
-        resistance_type="Which resistance to set",
-        value="Resistance percent. Over 100 fully blocks it, negative is a weakness (takes more)",
-    )
-    @app_commands.choices(
-        resistance_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in ALL_RESISTANCE_TYPES]
+        resistance_types="Which resistance(s) to set, comma-separated for several, e.g. 'slash,burn'",
+        values="Percent for each type above, same order, comma-separated, e.g. '20,-10'. "
+        "Over 100 fully blocks it, negative is a weakness (takes more)",
     )
     async def resistance(
         self,
         interaction: discord.Interaction,
         name: str,
-        resistance_type: app_commands.Choice[str],
-        value: int,
+        resistance_types: str,
+        values: str,
     ):
         character = load_character(name)
         if character is None:
@@ -257,10 +252,43 @@ class CharacterCog(commands.GroupCog, name="character"):
             )
             return
 
-        character.resistances[resistance_type.value] = value
+        types = [t.strip().lower() for t in resistance_types.split(",")]
+        value_tokens = [v.strip() for v in values.split(",")]
+
+        if len(types) != len(value_tokens):
+            await interaction.response.send_message(
+                f"Got {len(types)} resistance type(s) but {len(value_tokens)} value(s) -- "
+                f"these need to line up 1:1, e.g. resistance_types 'slash,burn' values '20,-10'.",
+                ephemeral=True,
+            )
+            return
+
+        for t in types:
+            if t not in ALL_RESISTANCE_TYPES:
+                await interaction.response.send_message(
+                    f"'{t}' isn't a valid resistance type. Choose from: "
+                    f"{', '.join(ALL_RESISTANCE_TYPES)}.",
+                    ephemeral=True,
+                )
+                return
+
+        parsed_values = []
+        for t, v in zip(types, value_tokens):
+            try:
+                parsed_values.append(int(v))
+            except ValueError:
+                await interaction.response.send_message(
+                    f"Value '{v}' for {t} isn't a whole number.", ephemeral=True
+                )
+                return
+
+        for t, v in zip(types, parsed_values):
+            character.resistances[t] = v
         save_character(character)
+
+        summary = ", ".join(f"{t.capitalize()} {v}%" for t, v in zip(types, parsed_values))
         await interaction.response.send_message(
-            f"Set {character.name}'s {resistance_type.name} resistance to {value}%.", ephemeral=True
+            f"Set {character.name}'s resistances: {summary}.", ephemeral=True
         )
 
     @app_commands.command(name="delete", description="Delete one of your characters")

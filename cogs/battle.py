@@ -1,3 +1,5 @@
+import asyncio
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -8,14 +10,13 @@ from game.battle import (
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
 from game.conditions import Trigger, TriggerContext, parse_trigger_text, TriggerParseError
-from game.colors import get_status_color
 from game.character import load_character
 from game.statuses import StatusInstance, decay_after_trigger, apply_status, INFLICTABLE_STATUSES
-from game.resistances import DAMAGE_TYPES, apply_resistance
-from game.emojis import status_emoji, coin_emoji, damage_type_emoji, stat_emoji, skill_slot_emoji, hint_emoji
+from game.resistances import DAMAGE_TYPES, ALL_RESISTANCE_TYPES, apply_resistance
+from game.emojis import status_emoji, coin_emoji, coin_roll_emoji, damage_type_emoji, stat_emoji, skill_slot_emoji, hint_emoji
 
 LOG_CHANNEL_ID = 1538071557560213595  # #bot-combat-logs
-MAX_EMBED_FIELDS = 25  # Discord's hard limit on fields per embed
+ADMIN_ROLE_ID = 1468446442430533737  # can manage any fighter, not just their own
 
 # Magnitude (potency * count) thresholds for the status-based half of a
 # fighter's Hint tier, checked highest first. Rupture then gets a flat
@@ -23,6 +24,22 @@ MAX_EMBED_FIELDS = 25  # Discord's hard limit on fields per embed
 # automatic on-hit trigger makes it a real threat even at low numbers,
 # not because it's inherently worse than the others at equal magnitude.
 STATUS_HINT_THRESHOLDS = [(15, 3), (6, 2), (1, 1)]
+
+
+def _can_manage_fighter(interaction: discord.Interaction, fighter: Fighter) -> bool:
+    """True if whoever's invoking this is either the fighter's own linked
+    owner, or holds the server's admin role (ADMIN_ROLE_ID). Used for
+    destructive fighter-management actions like /battle removefighter,
+    where "your own fighter, or an admin" is the right bar -- same
+    pattern /character edit/delete already use, just role-based instead
+    of Discord's built-in manage_guild permission, since that's what was
+    asked for here specifically.
+    """
+    if fighter.owner_id is not None and interaction.user.id == fighter.owner_id:
+        return True
+    if isinstance(interaction.user, discord.Member):
+        return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
+    return False
 
 
 class SkillConfirmView(discord.ui.View):
@@ -166,7 +183,7 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         placeholder="5, 5, 3, Blunt",
     )
     status_input = discord.ui.TextInput(
-        label="Per-coin statuses (comma-separated, or 'none')",
+        label="Per-coin statuses, or 'none'",
         style=discord.TextStyle.short,
         placeholder="none   or   Tremor:2:0,Tremor:2:0,Tremor:2:0",
         default="none",
@@ -176,7 +193,7 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         label="Triggers (one per line, blank for none)",
         style=discord.TextStyle.paragraph,
         placeholder=(
-            "[On Use] If this unit's Sanity is 45+, Coin Power +1\n"
+            "[On Use] Coin Power +1\n"
             ":Coin1: [On Hit] Inflict 2 Rupture Potency, 1 Count\n"
             "[Target Fixed]"
         ),
@@ -255,6 +272,35 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         preview_text = f"{self.target_fighter.name} would learn {self.skill_name.value}\n" + _skill_preview_text(skill)
         view = SkillConfirmView(self.target_fighter, skill, preview_text)
         await interaction.response.send_message(preview_text, view=view, ephemeral=True)
+
+
+# Discord silently rejects an ENTIRE modal with a 400 (which the caller
+# only ever sees as a generic "The application did not respond") if any
+# single TextInput's label is over 45 chars or placeholder is over 100
+# -- this bit us for real once (AddSkillModal's status_input label was
+# 46 chars, triggers_input's placeholder was 119). This check runs once
+# at import time and fails loudly and immediately if it ever regresses,
+# instead of silently again at some future /battle addskill call.
+def _check_modal_field_limits(modal_cls: type[discord.ui.Modal]) -> None:
+    for field_name in dir(modal_cls):
+        field = getattr(modal_cls, field_name, None)
+        if not isinstance(field, discord.ui.TextInput):
+            continue
+        label = field.label or ""
+        if len(label) > 45:
+            raise ValueError(
+                f"{modal_cls.__name__}.{field_name} label is {len(label)} chars "
+                f"(Discord's limit is 45): {label!r}"
+            )
+        placeholder = field.placeholder or ""
+        if len(placeholder) > 100:
+            raise ValueError(
+                f"{modal_cls.__name__}.{field_name} placeholder is {len(placeholder)} chars "
+                f"(Discord's limit is 100): {placeholder!r}"
+            )
+
+
+_check_modal_field_limits(AddSkillModal)
 
 
 class ClashDeclareView(discord.ui.View):
@@ -531,33 +577,6 @@ def compute_hint_tier(fighter: Fighter, battle: Battle) -> int | None:
     return tier if tier > 0 else None
 
 
-def build_fighter_embed(fighter: Fighter) -> discord.Embed:
-    primary_status = next(iter(fighter.statuses), None)
-    embed = discord.Embed(
-        title=fighter.name,
-        color=get_status_color(primary_status),
-    )
-    if fighter.avatar_url:
-        embed.set_thumbnail(url=fighter.avatar_url)
-    embed.add_field(name="Side", value=fighter.side, inline=True)
-    embed.add_field(name="HP", value=f"{fighter.hp}/{fighter.max_hp}", inline=True)
-    embed.add_field(name="Sanity", value=str(fighter.sanity), inline=True)
-    embed.add_field(
-        name="Slot Speeds",
-        value=" ".join(f"`{s}`" for s in fighter.slot_speeds),
-        inline=True,
-    )
-    if fighter.statuses:
-        lines = [
-            f"{status_emoji(s.name)} {s.name.capitalize()}: {s.potency}/{s.count}"
-            for s in fighter.statuses.values()
-        ]
-        embed.add_field(name="Statuses", value="\n".join(lines), inline=False)
-    if not fighter.is_alive():
-        embed.description = "Down"
-    return embed
-
-
 def build_battle_embed(battle: Battle) -> discord.Embed:
     type_info = BATTLE_TYPES.get(battle.battle_type, BATTLE_TYPES["spar"])
     embed = discord.Embed(title=type_info["title"], color=type_info["color"])
@@ -567,6 +586,7 @@ def build_battle_embed(battle: Battle) -> discord.Embed:
         if not fighters:
             continue
 
+        speed_icon = stat_emoji("speed")
         lines = []
         for f in fighters:
             filled = f.slots_filled()
@@ -575,7 +595,7 @@ def build_battle_embed(battle: Battle) -> discord.Embed:
                 slot_num = i + 1
                 speed_val = f.slot_speeds[i] if i < len(f.slot_speeds) else "?"
                 icon = coin_emoji("base") if slot_num in f.declared_actions else skill_slot_emoji(slot_num)
-                slot_parts.append(f"{icon}`{speed_val}`")
+                slot_parts.append(f"{icon}`{speed_val}`{speed_icon}")
             slot_line = " ".join(slot_parts)
 
             if filled == 0:
@@ -587,7 +607,9 @@ def build_battle_embed(battle: Battle) -> discord.Embed:
             down_tag = " (Down)" if not f.is_alive() else ""
 
             hint_tier = compute_hint_tier(f, battle)
-            hint_line = f"\n-# {hint_emoji(hint_tier)} Hint" if hint_tier else ""
+            # Just the icon now, no trailing " Hint" text -- the emoji
+            # alone is the signal, spelling it out was redundant.
+            hint_line = f"\n-# {hint_emoji(hint_tier)}" if hint_tier else ""
 
             lines.append(
                 f"**{f.name}**{down_tag} ({stat_emoji('hp')} {f.hp}/{f.max_hp}, "
@@ -841,6 +863,43 @@ def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Figh
     return log
 
 
+class CombatRevealView(discord.ui.View):
+    """One button per resolved action from a single /battle combat call.
+    The main combat message only ever shows a one-line summary per
+    action (so it never blows past Discord's per-embed character
+    limits no matter how many clashes happen in a round) -- clicking a
+    button reveals that ONE action's full breakdown (every attrition
+    round, every coin's face, every Trigger that fired) as an ephemeral
+    reply to whoever clicked, so each player can dig into just the
+    actions they care about without dumping everything into the shared
+    channel at once.
+
+    Discord caps a single message at 25 total components, so only the
+    first 25 entries get a button -- combat() adds a footer note on the
+    embed itself if that cap gets hit.
+    """
+
+    def __init__(self, entries: list[tuple[str, str]], timeout: float = 600):
+        super().__init__(timeout=timeout)
+        for label, detail in entries[:25]:
+            self.add_item(self._make_button(label, detail))
+
+    @staticmethod
+    def _make_button(label: str, detail: str) -> discord.ui.Button:
+        button = discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary)
+
+        async def callback(interaction: discord.Interaction):
+            embed = discord.Embed(title=label, description=detail[:4000], color=0x5865F2)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        button.callback = callback
+        return button
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
 class BattleCog(commands.GroupCog, name="battle"):
     """Commands for creating and managing battles."""
 
@@ -876,7 +935,7 @@ class BattleCog(commands.GroupCog, name="battle"):
     @app_commands.command(name="addfighter", description="Add a fighter to the current battle")
     @app_commands.describe(
         side="A or B",
-        character_name="Pull stats, avatar, and resistances from a saved character (optional)",
+        character_name="Pull stats, avatar, and resistances from a saved character",
         name="Fighter's name, only used if not pulling from a saved character",
         hp="Starting HP, only used if not pulling from a saved character (default 100)",
         speed_min="Lowest a skill slot's Speed can roll (default: flat 10 if omitted)",
@@ -960,37 +1019,41 @@ class BattleCog(commands.GroupCog, name="battle"):
         await interaction.response.send_message(f"Added {name} to Side {side} ({hp} HP).", ephemeral=True)
         await sync_battle_message(self.bot, battle)
 
-    @app_commands.command(name="status", description="Show the current battle state")
-    async def status(self, interaction: discord.Interaction):
-        battle = self.battles.get(interaction.channel_id)
-        if battle is None:
-            await interaction.response.send_message("No active battle here.", ephemeral=True)
-            return
-        if not battle.fighters:
-            await interaction.response.send_message("No fighters in this battle yet.", ephemeral=True)
-            return
-        ordered = sorted(battle.fighters, key=lambda f: f.side)
-        embeds = [build_fighter_embed(f) for f in ordered]
-        await interaction.response.send_message(embeds=embeds)
-
-    @app_commands.command(name="setstatus", description="Manually set a fighter's status (testing/admin tool)")
+    @app_commands.command(
+        name="setstatus",
+        description="Admin/testing tool: directly set a fighter's stats, resistances, and/or a status",
+    )
     @app_commands.describe(
         fighter="Fighter name",
-        status_name="Which status to set, or 'none' to clear all statuses",
-        potency="Potency (ignored if status_name is none)",
-        count="Count (ignored if status_name is none)",
+        status_name="A status to set, or 'none' to clear all statuses",
+        potency="Potency for status_name",
+        count="Count for status_name",
+        hp="Set current HP",
+        max_hp="Set max HP",
+        sanity="Set Sanity",
+        speed_min="Set the low end of this fighter's Speed range (needs speed_max too, re-rolls slots)",
+        speed_max="Set the high end of this fighter's Speed range (needs speed_min too, re-rolls slots)",
+        power="Set Power",
+        resistance_input="Resistance(s) to set: 'Type:Value', comma-separated for several, e.g. 'slash:20,burn:-10'",
     )
     @app_commands.choices(
         status_name=[app_commands.Choice(name=s.capitalize(), value=s) for s in INFLICTABLE_STATUSES]
-        + [app_commands.Choice(name="None (clear all)", value="none")]
+        + [app_commands.Choice(name="None (clear all statuses)", value="none")]
     )
     async def setstatus(
         self,
         interaction: discord.Interaction,
         fighter: str,
-        status_name: app_commands.Choice[str],
+        status_name: app_commands.Choice[str] | None = None,
         potency: int = 0,
         count: int = 0,
+        hp: int | None = None,
+        max_hp: int | None = None,
+        sanity: int | None = None,
+        speed_min: int | None = None,
+        speed_max: int | None = None,
+        power: int | None = None,
+        resistance_input: str | None = None,
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -1002,18 +1065,96 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message(f"No fighter named {fighter}.", ephemeral=True)
             return
 
-        if status_name.value == "none":
-            target_fighter.statuses.clear()
-            await interaction.response.send_message(f"Cleared all statuses on {target_fighter.name}.")
+        if (speed_min is None) != (speed_max is None):
+            await interaction.response.send_message(
+                "speed_min and speed_max must be set together, or not at all.", ephemeral=True
+            )
             return
 
-        target_fighter.set_status_instance(
-            StatusInstance(name=status_name.value, potency=potency, count=count)
-        )
-        await interaction.response.send_message(
-            f"Set {target_fighter.name}'s {status_emoji(status_name.value)} "
-            f"{status_name.name} to {potency}/{count}."
-        )
+        # Parsed and validated up front, before anything gets mutated --
+        # same "all-or-nothing" principle as the rest of this command:
+        # a bad resistance entry shouldn't leave hp/sanity/etc already
+        # applied while resistances silently fail.
+        resistance_changes: list[tuple[str, int]] = []
+        if resistance_input is not None:
+            for token in resistance_input.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                parts = token.split(":")
+                if len(parts) != 2:
+                    await interaction.response.send_message(
+                        f"Resistance entry '{token}' is invalid. Use 'Type:Value', comma-separated "
+                        f"for several, e.g. 'slash:20,burn:-10'.",
+                        ephemeral=True,
+                    )
+                    return
+                r_type, r_value_raw = parts[0].strip().lower(), parts[1].strip()
+                if r_type not in ALL_RESISTANCE_TYPES:
+                    await interaction.response.send_message(
+                        f"'{r_type}' isn't a valid resistance type. Choose from: "
+                        f"{', '.join(ALL_RESISTANCE_TYPES)}.",
+                        ephemeral=True,
+                    )
+                    return
+                try:
+                    r_value = int(r_value_raw)
+                except ValueError:
+                    await interaction.response.send_message(
+                        f"Resistance value '{r_value_raw}' for {r_type} isn't a whole number.",
+                        ephemeral=True,
+                    )
+                    return
+                resistance_changes.append((r_type, r_value))
+
+        changes = []
+
+        if status_name is not None:
+            if status_name.value == "none":
+                target_fighter.statuses.clear()
+                changes.append("all statuses cleared")
+            else:
+                target_fighter.set_status_instance(
+                    StatusInstance(name=status_name.value, potency=potency, count=count)
+                )
+                changes.append(
+                    f"{status_emoji(status_name.value)} {status_name.name} -> {potency}/{count}"
+                )
+
+        if hp is not None:
+            target_fighter.hp = hp
+            changes.append(f"HP -> {hp}")
+
+        if max_hp is not None:
+            target_fighter.max_hp = max_hp
+            changes.append(f"Max HP -> {max_hp}")
+
+        if sanity is not None:
+            target_fighter.sanity = sanity
+            changes.append(f"Sanity -> {sanity}")
+
+        if speed_min is not None:
+            target_fighter.speed_min = speed_min
+            target_fighter.speed_max = speed_max
+            target_fighter.roll_slot_speeds()
+            changes.append(f"Speed range -> {speed_min}-{speed_max} (slots re-rolled)")
+
+        if power is not None:
+            target_fighter.power = power
+            changes.append(f"Power -> {power}")
+
+        for r_type, r_value in resistance_changes:
+            target_fighter.resistances[r_type] = r_value
+            changes.append(f"{r_type.capitalize()} resistance -> {r_value}%")
+
+        if not changes:
+            await interaction.response.send_message(
+                "Nothing to change, no fields were provided.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(f"Updated {target_fighter.name}: {', '.join(changes)}.")
+        await sync_battle_message(self.bot, battle)
 
     @app_commands.command(name="addskill", description="Give a fighter a skill (opens a popup)")
     @app_commands.describe(fighter="Which fighter learns this skill")
@@ -1151,7 +1292,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 if owner is not None:
                     try:
                         dm_message = await owner.send(
-                            f"**{caster.name}** (Slot {slot}, Speed {caster_speed}) wants to take "
+                            f"**{caster.name}** (Slot {slot}, {stat_emoji('speed')}{caster_speed}) wants to take "
                             f"over your **{partner.name}**'s clash against **{target_fighter.name}**'s "
                             f"Slot {target_slot}, using **{skill.name}**.\n\n"
                             f"Approve gives it to them (your Slot {partner_slot} is cleared). "
@@ -1184,29 +1325,24 @@ class BattleCog(commands.GroupCog, name="battle"):
                 )
                 return
 
-        scouted_skill = target_fighter.get_declared_skill_in_slot(target_slot)
-        can_scout = caster_speed >= target_speed and scouted_skill is not None
-
+        # Deliberately no preview of the target's own skill here, ever --
+        # you don't get to see what an enemy is bringing before you
+        # commit, regardless of Speed. Whether this ends up a real Clash
+        # is also genuinely unknown at declare time: it only becomes one
+        # if the target's own action in target_slot targets this exact
+        # (caster, slot) back (see combat()'s mutual-match logic). If it
+        # doesn't, this resolves as an unopposed attack instead -- and
+        # you won't know which until /battle combat actually runs.
         view = ClashDeclareView(caster, skill, target_fighter, slot, target_slot, self.bot, battle)
-
-        if can_scout:
-            preview = (
-                f"{caster.name}'s Slot {slot} (Speed {caster_speed}) is fast enough to read "
-                f"{target_fighter.name}'s Slot {target_slot} (Speed {target_speed}) before committing.\n\n"
-                f"They're bringing:\n{_skill_preview_text(scouted_skill)}\n\n"
-                f"Confirm to lock in {skill.name} against it?"
-            )
-        else:
-            reason = (
-                "your slot is slower than theirs" if caster_speed < target_speed
-                else f"{target_fighter.name} hasn't assigned a skill to that slot yet"
-            )
-            preview = (
-                f"You can't scout {target_fighter.name}'s Slot {target_slot} ({reason}). "
-                f"If they don't end up targeting your Slot {slot} back, this will resolve as an "
-                f"**unopposed** attack instead of a Clash.\n\n"
-                f"Confirm to lock in {skill.name} against it anyway?"
-            )
+        speed_icon = stat_emoji("speed")
+        preview = (
+            f"**{caster.name}**'s Slot {slot} ({speed_icon}{caster_speed}) locks in **{skill.name}** "
+            f"aimed at {target_fighter.name}'s Slot {target_slot}.\n\n"
+            f"This only becomes a Clash if {target_fighter.name} targets your Slot {slot} back with "
+            f"their Slot {target_slot}. Otherwise it resolves unopposed. You won't know which until "
+            f"combat actually runs.\n\n"
+            f"Confirm to lock it in?"
+        )
 
         await interaction.response.send_message(preview, view=view, ephemeral=True)
 
@@ -1233,6 +1369,29 @@ class BattleCog(commands.GroupCog, name="battle"):
                 f"{caster.name}'s Slot {slot} wasn't declared.", ephemeral=True
             )
 
+    @app_commands.command(name="removefighter", description="Remove a fighter from the current battle")
+    @app_commands.describe(fighter="Fighter to remove")
+    async def removefighter(self, interaction: discord.Interaction, fighter: str):
+        battle = self.battles.get(interaction.channel_id)
+        if battle is None:
+            await interaction.response.send_message("No active battle here.", ephemeral=True)
+            return
+
+        target_fighter = battle.get_fighter(fighter)
+        if target_fighter is None:
+            await interaction.response.send_message(f"No fighter named {fighter}.", ephemeral=True)
+            return
+
+        if not _can_manage_fighter(interaction, target_fighter):
+            await interaction.response.send_message(
+                "Only this fighter's own owner or an admin can remove them.", ephemeral=True
+            )
+            return
+
+        battle.fighters.remove(target_fighter)
+        await interaction.response.send_message(f"Removed {target_fighter.name} from the battle.")
+        await sync_battle_message(self.bot, battle)
+
     @app_commands.command(name="combat", description="Resolve everyone's declared actions this Combat Phase")
     async def combat(self, interaction: discord.Interaction):
         battle = self.battles.get(interaction.channel_id)
@@ -1247,18 +1406,12 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        embed = discord.Embed(
-            title=f"Combat Phase, Round {battle.round_number}",
-            color=0x5865F2,
-        )
-        truncated = False
-
-        def add_field_safe(name: str, value: str):
-            nonlocal truncated
-            if len(embed.fields) >= MAX_EMBED_FIELDS:
-                truncated = True
-                return
-            embed.add_field(name=name, value=value, inline=False)
+        # This whole command can take a moment (matching, resolving,
+        # applying triggers for a whole round), so acknowledge the
+        # interaction immediately and do everything else as followups --
+        # that also lets us do the two-stage "rolling, then results"
+        # reveal below via message edits.
+        await interaction.response.defer()
 
         # Fires [Combat Start] (first round of the battle only) and
         # [Turn Start] (every round) against every living fighter's
@@ -1267,8 +1420,6 @@ class BattleCog(commands.GroupCog, name="battle"):
         # before any clash/unopposed resolution below, and before
         # battle.started flips to True at the end of this method.
         passive_log = fire_passive_triggers(battle)
-        if passive_log:
-            add_field_safe("Passive Triggers", "\n".join(passive_log)[:1024])
 
         entries = []
         for f in battle.fighters:
@@ -1312,10 +1463,43 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         units.sort(key=unit_speed, reverse=True)
 
+        # Coin-roll flavor: show every action "in progress" first, with
+        # the animated rolling-coin icon, before any real resolution
+        # happens below -- purely cosmetic (the actual coin tosses
+        # already happened the instant resolve_skill/resolve_round_clash
+        # get called further down; this doesn't roll anything live), but
+        # it gives players something to see mid-command instead of the
+        # results just appearing instantly.
+        roll_icon = coin_roll_emoji()
+        rolling_lines = []
+        for u in units:
+            if u[0] == "clash":
+                rolling_lines.append(f"{roll_icon} {u[1]['caster'].name} vs {u[2]['caster'].name}...")
+            else:
+                rolling_lines.append(f"{roll_icon} {u[1]['caster'].name} -> {u[1]['target'].name}...")
+
+        rolling_embed = discord.Embed(
+            title=f"Combat Phase, Round {battle.round_number}",
+            description="\n".join(rolling_lines) if rolling_lines else "Nothing declared this round.",
+            color=0x5865F2,
+        )
+        combat_message = await interaction.followup.send(embed=rolling_embed, wait=True)
+        if rolling_lines:
+            await asyncio.sleep(1.4)
+
         # Tracks whether we've resolved anything yet this Combat Phase, for
         # the first_hit_of_round Trigger condition. One clash counts as a
         # single event (both sides share the same flag value).
         first_action_done = False
+
+        # Two parallel outputs per resolved action: a short one-line
+        # summary (goes straight into the main embed's description, so
+        # the message itself always stays small regardless of how many
+        # actions happened this round) and the full breakdown text (only
+        # shown if a player clicks that action's button on
+        # CombatRevealView -- see its docstring above).
+        summary_lines: list[str] = []
+        reveal_entries: list[tuple[str, str]] = []
 
         for u in units:
             if u[0] == "clash":
@@ -1406,13 +1590,12 @@ class BattleCog(commands.GroupCog, name="battle"):
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
                     field_value += "\n" + "\n".join(trigger_log)
-                if len(field_value) > 1024:
-                    field_value = field_value[:1000] + "\n...(truncated)"
 
-                add_field_safe(
-                    f"Clash: {fighter_a.name} Slot{entry_a['slot']} vs {fighter_b.name} Slot{entry_b['slot']}",
-                    field_value,
+                summary_lines.append(
+                    f"⚔️ **{winner.name}** beats **{loser.name}** -- {total_damage} damage "
+                    f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
                 )
+                reveal_entries.append((f"{fighter_a.name} vs {fighter_b.name}", field_value))
 
             else:
                 _, entry = u
@@ -1459,16 +1642,47 @@ class BattleCog(commands.GroupCog, name="battle"):
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
                     field_value += "\n" + "\n".join(trigger_log)
-                if len(field_value) > 1024:
-                    field_value = field_value[:1000] + "\n...(truncated)"
 
-                add_field_safe(
-                    f"{fighter.name} Slot{entry['slot']} attacks {target.name} Slot{entry['target_slot']} (unopposed)",
-                    field_value,
+                summary_lines.append(
+                    f"🗡️ **{fighter.name}** hits **{target.name}** (unopposed) -- {total_damage} damage "
+                    f"({target.name}: {target.hp}/{target.max_hp} HP)"
+                )
+                reveal_entries.append(
+                    (f"{fighter.name} -> {target.name} (unopposed)", field_value)
                 )
 
-        if truncated:
-            embed.set_footer(text="Some actions this round were too numerous to display and were skipped.")
+        # Same one-line-per-action pattern as the rolling embed above,
+        # now with real results instead of "rolling..." placeholders.
+        # Passive Triggers go first since they happened before any
+        # clash/attack this round (see fire_passive_triggers above).
+        description_lines = []
+        if passive_log:
+            description_lines.append("**Passive Triggers**\n" + "\n".join(passive_log))
+        if summary_lines:
+            description_lines.append("\n".join(summary_lines))
+        description = "\n\n".join(description_lines) if description_lines else "Nothing declared this round."
+
+        # Discord's embed description cap is 4096 chars -- with enough
+        # actions in one round this really could overflow, same reason
+        # CombatRevealView.__init__ caps its buttons at 25. Truncate
+        # defensively rather than let the whole edit fail outright.
+        footer_note = None
+        if len(description) > 4000:
+            description = description[:4000] + "\n...(truncated)"
+            footer_note = "Some results this round were too numerous to display fully."
+        if len(reveal_entries) > 25:
+            footer_note = (
+                (footer_note + " " if footer_note else "")
+                + "Only the first 25 actions have a detail button."
+            )
+
+        final_embed = discord.Embed(
+            title=f"Combat Phase, Round {battle.round_number}",
+            description=description,
+            color=0x5865F2,
+        )
+        if footer_note:
+            final_embed.set_footer(text=footer_note)
 
         # Whatever [Combat Start] triggers were going to fire this battle
         # already fired above (or didn't, if nobody had one declared) --
@@ -1477,7 +1691,14 @@ class BattleCog(commands.GroupCog, name="battle"):
         battle.started = True
 
         battle.start_new_round()
-        await interaction.response.send_message(embed=embed)
+
+        # The interaction was deferred and its one followup already sent
+        # (the "rolling" message) -- interaction.response is spent, so
+        # the real results EDIT that same message rather than sending a
+        # new one. Click-to-reveal buttons attach here, on the final
+        # results message, not the rolling one.
+        reveal_view = CombatRevealView(reveal_entries) if reveal_entries else None
+        await combat_message.edit(embed=final_embed, view=reveal_view)
         await sync_battle_message(self.bot, battle)
 
     @app_commands.command(name="end", description="End the battle in this channel")
