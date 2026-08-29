@@ -91,20 +91,87 @@ def _skill_preview_text(skill: Skill) -> str:
     return text
 
 
-class AddSkillTriggerModal(discord.ui.Modal, title="Skill Triggers"):
-    """The locked-in modal popup for /battle addskill: one multi-line
-    paste box for Conditional Triggers, in the real bracket-tag syntax
-    parse_trigger_text expects (one line per Trigger or skill-flag tag),
-    instead of the old flat 'condition|effect|hint:N' pipe format.
+def _parse_status_tokens(
+    status_input: str, coins: int
+) -> tuple[list[str | None], list[int], list[int], str | None]:
+    """Parses the comma-separated per-coin status string ('none' or
+    'Name:Potency:Count' per coin) into three aligned lists. Returns
+    (coin_statuses, potencies, counts, error) -- error is None on
+    success, or a user-facing message on failure (ignore the lists in
+    that case). Pulled out of addskill's old body so the new popup's
+    on_submit can share the exact same parsing/error text.
+    """
+    tokens = [t.strip() for t in status_input.split(",")]
+    if len(tokens) == 1 and tokens[0].lower() == "none":
+        tokens = ["none"] * coins
 
-    All the OTHER skill fields (name, base_power, coin_power, coins,
-    damage_type, status_input) are already validated by the time this
-    modal is shown -- addskill collects those as normal slash-command
-    params first, then opens this to collect just the trigger block,
-    since that's the one field too long and structured for a single
-    slash-command text option.
+    if len(tokens) != coins:
+        return [], [], [], (
+            f"Statuses needs exactly {coins} comma-separated entries (one per coin), "
+            f"got {len(tokens)}. Use 'none' for a coin with no status. "
+            f"Example: {','.join(['none'] * coins)}"
+        )
+
+    coin_statuses: list[str | None] = []
+    coin_status_potencies: list[int] = []
+    coin_status_counts: list[int] = []
+
+    for i, token in enumerate(tokens):
+        if token.lower() == "none":
+            coin_statuses.append(None)
+            coin_status_potencies.append(0)
+            coin_status_counts.append(0)
+            continue
+
+        parts = token.split(":")
+        if len(parts) != 3:
+            return [], [], [], f"Coin {i + 1} entry '{token}' is invalid. Use 'Name:Potency:Count' or 'none'."
+
+        status_name_raw, potency_raw, count_raw = parts
+        try:
+            potency = int(potency_raw)
+            count = int(count_raw)
+        except ValueError:
+            return [], [], [], f"Coin {i + 1} entry '{token}' has a non-numeric potency/count."
+
+        coin_statuses.append(status_name_raw.strip().lower())
+        coin_status_potencies.append(potency)
+        coin_status_counts.append(count)
+
+    return coin_statuses, coin_status_potencies, coin_status_counts, None
+
+
+class AddSkillModal(discord.ui.Modal, title="New Skill"):
+    """The full skill-creation popup: everything /battle addskill used to
+    collect as 6 required slash-command options (base_power, coin_power,
+    coins, damage_type, status_input) PLUS the separate trigger modal is
+    now just this one popup. addskill itself only takes `fighter` --
+    who's learning it -- and opens this immediately.
+
+    Discord caps a modal at 5 components. To fit within that, Base
+    Power / Coin Power / Coins / Damage Type are packed into one
+    comma-separated line ("5, 5, 3, Blunt") and parsed by hand in
+    on_submit below, same pattern status_input already used for
+    per-coin data -- there wasn't room to give each its own box.
     """
 
+    skill_name = discord.ui.TextInput(
+        label="Skill Name",
+        style=discord.TextStyle.short,
+        max_length=100,
+    )
+    stats_input = discord.ui.TextInput(
+        label="Base Power, Coin Power, Coins, Damage Type",
+        style=discord.TextStyle.short,
+        placeholder="5, 5, 3, Blunt",
+    )
+    status_input = discord.ui.TextInput(
+        label="Per-coin statuses (comma-separated, or 'none')",
+        style=discord.TextStyle.short,
+        placeholder="none   or   Tremor:2:0,Tremor:2:0,Tremor:2:0",
+        default="none",
+        required=False,
+    )
     triggers_input = discord.ui.TextInput(
         label="Triggers (one per line, blank for none)",
         style=discord.TextStyle.paragraph,
@@ -117,30 +184,52 @@ class AddSkillTriggerModal(discord.ui.Modal, title="Skill Triggers"):
         max_length=4000,
     )
 
-    def __init__(
-        self,
-        target_fighter: Fighter,
-        skill_name: str,
-        base_power: int,
-        coin_power: int,
-        coins: int,
-        damage_type: str,
-        coin_statuses: list[str | None],
-        coin_status_potencies: list[int],
-        coin_status_counts: list[int],
-    ):
+    def __init__(self, target_fighter: Fighter):
         super().__init__()
         self.target_fighter = target_fighter
-        self.skill_name = skill_name
-        self.base_power = base_power
-        self.coin_power = coin_power
-        self.coins = coins
-        self.damage_type = damage_type
-        self.coin_statuses = coin_statuses
-        self.coin_status_potencies = coin_status_potencies
-        self.coin_status_counts = coin_status_counts
 
     async def on_submit(self, interaction: discord.Interaction):
+        stats_parts = [p.strip() for p in self.stats_input.value.split(",")]
+        if len(stats_parts) != 4:
+            await interaction.response.send_message(
+                "Base Power, Coin Power, Coins, Damage Type needs exactly 4 comma-separated "
+                "values, e.g. '5, 5, 3, Blunt'.",
+                ephemeral=True,
+            )
+            return
+
+        base_power_raw, coin_power_raw, coins_raw, damage_type_raw = stats_parts
+        try:
+            base_power = int(base_power_raw)
+            coin_power = int(coin_power_raw)
+            coins = int(coins_raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "Base Power, Coin Power, and Coins must all be whole numbers.",
+                ephemeral=True,
+            )
+            return
+
+        if not (1 <= coins <= 4):
+            await interaction.response.send_message("Coins must be between 1 and 4.", ephemeral=True)
+            return
+
+        damage_type = damage_type_raw.strip().lower()
+        if damage_type not in DAMAGE_TYPES:
+            await interaction.response.send_message(
+                f"'{damage_type_raw}' isn't a valid damage type. Choose one of: "
+                f"{', '.join(t.capitalize() for t in DAMAGE_TYPES)}.",
+                ephemeral=True,
+            )
+            return
+
+        coin_statuses, coin_status_potencies, coin_status_counts, status_error = _parse_status_tokens(
+            self.status_input.value or "none", coins
+        )
+        if status_error:
+            await interaction.response.send_message(status_error, ephemeral=True)
+            return
+
         try:
             triggers, flags = parse_trigger_text(self.triggers_input.value or "")
         except TriggerParseError as e:
@@ -151,19 +240,19 @@ class AddSkillTriggerModal(discord.ui.Modal, title="Skill Triggers"):
             return
 
         skill = Skill(
-            name=self.skill_name,
-            base_power=self.base_power,
-            coin_power=self.coin_power,
-            coins=self.coins,
-            damage_type=self.damage_type,
-            coin_statuses=self.coin_statuses,
-            coin_status_potencies=self.coin_status_potencies,
-            coin_status_counts=self.coin_status_counts,
+            name=self.skill_name.value,
+            base_power=base_power,
+            coin_power=coin_power,
+            coins=coins,
+            damage_type=damage_type,
+            coin_statuses=coin_statuses,
+            coin_status_potencies=coin_status_potencies,
+            coin_status_counts=coin_status_counts,
             triggers=triggers,
             tags=flags,
         )
 
-        preview_text = f"{self.target_fighter.name} would learn {self.skill_name}\n" + _skill_preview_text(skill)
+        preview_text = f"{self.target_fighter.name} would learn {self.skill_name.value}\n" + _skill_preview_text(skill)
         view = SkillConfirmView(self.target_fighter, skill, preview_text)
         await interaction.response.send_message(preview_text, view=view, ephemeral=True)
 
@@ -926,33 +1015,12 @@ class BattleCog(commands.GroupCog, name="battle"):
             f"{status_name.name} to {potency}/{count}."
         )
 
-    @app_commands.command(name="addskill", description="Give a fighter a skill")
-    @app_commands.describe(
-        fighter="Which fighter learns this skill",
-        skill_name="Skill name",
-        base_power="Base Power",
-        coin_power="Coin Power",
-        coins="Number of coins (1-4)",
-        damage_type="Slash, Blunt, or Pierce",
-        status_input=(
-            "Per-coin statuses, comma-separated, one entry per coin. "
-            "Each entry is 'none' or 'Name:Potency:Count'. "
-            "Example for 3 coins: none,Rupture:3:2,Bleed:1:1"
-        ),
-    )
-    @app_commands.choices(
-        damage_type=[app_commands.Choice(name=t.capitalize(), value=t) for t in DAMAGE_TYPES],
-    )
+    @app_commands.command(name="addskill", description="Give a fighter a skill (opens a popup)")
+    @app_commands.describe(fighter="Which fighter learns this skill")
     async def addskill(
         self,
         interaction: discord.Interaction,
         fighter: str,
-        skill_name: str,
-        base_power: int,
-        coin_power: int,
-        coins: int,
-        damage_type: app_commands.Choice[str],
-        status_input: str = "none",
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -964,76 +1032,11 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message(f"No fighter named {fighter}.", ephemeral=True)
             return
 
-        if not (1 <= coins <= 4):
-            await interaction.response.send_message("Coins must be between 1 and 4.", ephemeral=True)
-            return
-
-        tokens = [t.strip() for t in status_input.split(",")]
-        if len(tokens) == 1 and tokens[0].lower() == "none":
-            tokens = ["none"] * coins
-
-        if len(tokens) != coins:
-            await interaction.response.send_message(
-                f"status_input needs exactly {coins} comma-separated entries (one per coin), "
-                f"got {len(tokens)}. Use 'none' for a coin with no status. "
-                f"Example: {','.join(['none'] * coins)}",
-                ephemeral=True,
-            )
-            return
-
-        coin_statuses: list[str | None] = []
-        coin_status_potencies: list[int] = []
-        coin_status_counts: list[int] = []
-
-        for i, token in enumerate(tokens):
-            if token.lower() == "none":
-                coin_statuses.append(None)
-                coin_status_potencies.append(0)
-                coin_status_counts.append(0)
-                continue
-
-            parts = token.split(":")
-            if len(parts) != 3:
-                await interaction.response.send_message(
-                    f"Coin {i + 1} entry '{token}' is invalid. Use 'Name:Potency:Count' or 'none'.",
-                    ephemeral=True,
-                )
-                return
-
-            status_name_raw, potency_raw, count_raw = parts
-            try:
-                potency = int(potency_raw)
-                count = int(count_raw)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"Coin {i + 1} entry '{token}' has a non-numeric potency/count.",
-                    ephemeral=True,
-                )
-                return
-
-            coin_statuses.append(status_name_raw.strip().lower())
-            coin_status_potencies.append(potency)
-            coin_status_counts.append(count)
-
-        # Everything else about the skill is validated -- hand off to the
-        # Trigger modal now, since send_modal has to be the interaction's
-        # first (and only) response. The modal's on_submit does the actual
-        # parse_trigger_text call, builds the Skill (with .tags from
-        # whatever skill-flag lines were pasted), and shows the confirm
-        # preview, all using ITS OWN interaction from the modal submit.
-        await interaction.response.send_modal(
-            AddSkillTriggerModal(
-                target_fighter=target_fighter,
-                skill_name=skill_name,
-                base_power=base_power,
-                coin_power=coin_power,
-                coins=coins,
-                damage_type=damage_type.value,
-                coin_statuses=coin_statuses,
-                coin_status_potencies=coin_status_potencies,
-                coin_status_counts=coin_status_counts,
-            )
-        )
+        # The ONLY response for this interaction -- everything about the
+        # skill (name, stats, damage type, statuses, triggers) is now
+        # collected in one popup instead of 6 required slash-command
+        # options plus a second modal. See AddSkillModal above.
+        await interaction.response.send_modal(AddSkillModal(target_fighter))
 
     @app_commands.command(
         name="declare",
