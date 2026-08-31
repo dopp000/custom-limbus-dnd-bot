@@ -66,6 +66,39 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
     return await channel.create_webhook(name=WEBHOOK_NAME)
 
 
+def _parse_resistance_tokens(resistance_types: str, values: str) -> tuple[dict[str, int], str | None]:
+    """Parses the paired comma-separated 'resistance_types'/'values' strings
+    (e.g. 'slash,burn' + '20,-10') into a {type: value} dict, matched
+    positionally. Returns (parsed, error) -- error is None on success, or a
+    user-facing message on failure (ignore parsed in that case). Shared by
+    /character resistance and the resistance_types/values params on
+    /character edit, so both give identical validation and error wording.
+    """
+    types = [t.strip().lower() for t in resistance_types.split(",")]
+    value_tokens = [v.strip() for v in values.split(",")]
+
+    if len(types) != len(value_tokens):
+        return {}, (
+            f"Got {len(types)} resistance type(s) but {len(value_tokens)} value(s) -- "
+            f"these need to line up 1:1, e.g. resistance_types 'slash,burn' values '20,-10'."
+        )
+
+    for t in types:
+        if t not in ALL_RESISTANCE_TYPES:
+            return {}, (
+                f"'{t}' isn't a valid resistance type. Choose from: {', '.join(ALL_RESISTANCE_TYPES)}."
+            )
+
+    parsed: dict[str, int] = {}
+    for t, v in zip(types, value_tokens):
+        try:
+            parsed[t] = int(v)
+        except ValueError:
+            return {}, f"Value '{v}' for {t} isn't a whole number."
+
+    return parsed, None
+
+
 class CharacterCog(commands.GroupCog, name="character"):
     """Commands for creating and viewing persistent characters."""
 
@@ -151,6 +184,8 @@ class CharacterCog(commands.GroupCog, name="character"):
         speed_min="Lowest a skill slot's Speed can roll each round (needs speed_max too)",
         speed_max="Highest a skill slot's Speed can roll each round (needs speed_min too)",
         power="New Power",
+        resistance_types="Resistance(s) to set, comma-separated for several, e.g. 'slash,burn' (needs values too)",
+        values="Percent for each type above, same order, comma-separated, e.g. '20,-10' (needs resistance_types too)",
     )
     async def edit(
         self,
@@ -162,6 +197,8 @@ class CharacterCog(commands.GroupCog, name="character"):
         speed_min: int | None = None,
         speed_max: int | None = None,
         power: int | None = None,
+        resistance_types: str | None = None,
+        values: str | None = None,
     ):
         character = load_character(name)
         if character is None:
@@ -181,6 +218,20 @@ class CharacterCog(commands.GroupCog, name="character"):
                 ephemeral=True,
             )
             return
+
+        if (resistance_types is None) != (values is None):
+            await interaction.response.send_message(
+                "resistance_types and values must be set together -- provide both, or neither.",
+                ephemeral=True,
+            )
+            return
+
+        parsed_resistances: dict[str, int] = {}
+        if resistance_types is not None:
+            parsed_resistances, error = _parse_resistance_tokens(resistance_types, values)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
 
         changes = []
 
@@ -211,6 +262,11 @@ class CharacterCog(commands.GroupCog, name="character"):
         if power is not None:
             character.power = power
             changes.append(f"Power -> {power}")
+
+        if parsed_resistances:
+            character.resistances.update(parsed_resistances)
+            summary = ", ".join(f"{t.capitalize()} {v}%" for t, v in parsed_resistances.items())
+            changes.append(f"resistances -> {summary}")
 
         if not changes:
             await interaction.response.send_message(
@@ -252,41 +308,15 @@ class CharacterCog(commands.GroupCog, name="character"):
             )
             return
 
-        types = [t.strip().lower() for t in resistance_types.split(",")]
-        value_tokens = [v.strip() for v in values.split(",")]
-
-        if len(types) != len(value_tokens):
-            await interaction.response.send_message(
-                f"Got {len(types)} resistance type(s) but {len(value_tokens)} value(s) -- "
-                f"these need to line up 1:1, e.g. resistance_types 'slash,burn' values '20,-10'.",
-                ephemeral=True,
-            )
+        parsed, error = _parse_resistance_tokens(resistance_types, values)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
 
-        for t in types:
-            if t not in ALL_RESISTANCE_TYPES:
-                await interaction.response.send_message(
-                    f"'{t}' isn't a valid resistance type. Choose from: "
-                    f"{', '.join(ALL_RESISTANCE_TYPES)}.",
-                    ephemeral=True,
-                )
-                return
-
-        parsed_values = []
-        for t, v in zip(types, value_tokens):
-            try:
-                parsed_values.append(int(v))
-            except ValueError:
-                await interaction.response.send_message(
-                    f"Value '{v}' for {t} isn't a whole number.", ephemeral=True
-                )
-                return
-
-        for t, v in zip(types, parsed_values):
-            character.resistances[t] = v
+        character.resistances.update(parsed)
         save_character(character)
 
-        summary = ", ".join(f"{t.capitalize()} {v}%" for t, v in zip(types, parsed_values))
+        summary = ", ".join(f"{t.capitalize()} {v}%" for t, v in parsed.items())
         await interaction.response.send_message(
             f"Set {character.name}'s resistances: {summary}.", ephemeral=True
         )
