@@ -580,6 +580,8 @@ def compute_hint_tier(fighter: Fighter, battle: Battle) -> int | None:
 def build_battle_embed(battle: Battle) -> discord.Embed:
     type_info = BATTLE_TYPES.get(battle.battle_type, BATTLE_TYPES["spar"])
     embed = discord.Embed(title=type_info["title"], color=type_info["color"])
+    if "image" in type_info:
+        embed.set_image(url=type_info["image"])
 
     for side_name in ("A", "B"):
         fighters = sorted(battle.side(side_name), key=lambda f: max(f.slot_speeds, default=0), reverse=True)
@@ -639,7 +641,7 @@ async def sync_battle_message(bot: commands.Bot, battle: Battle):
 
 def apply_incoming_hit(
     attacker_skill: Skill, result: SkillResult, target: Fighter, caster: Fighter
-) -> tuple[int, list[str], list[Trigger]]:
+) -> tuple[int, list[str], list[Trigger], int, int, int]:
     """Applies each landed coin's damage/status, same as before, and now
     also collects whichever per-coin Triggers (on_hit/heads_hit/tails_hit)
     fired on that coin (see CoinResult.fired_triggers), so the caller can
@@ -656,13 +658,53 @@ def apply_incoming_hit(
     coin's normal damage (it's still a hit of that skill's damage_type,
     just a harder one), unlike Rupture's bonus below, which is the
     TARGET's own reaction and deliberately bypasses resistance entirely.
+
+    Now returns three extra values: evade_count, counter_damage, and
+    counter_count.
+
+    evade_count is how many of this result's coins had is_evaded set
+    (computed in resolve_skill, see its Evasion docstring). An evaded
+    coin is skipped entirely here -- no resistance check, no Rupture,
+    no coin status, doesn't add to total_damage (its damage_dealt is
+    already 0 straight out of resolve_skill) -- and just logs the
+    dodge, decaying 1 count off the target's real Evasion stack per
+    dodge (same deferred-mutation pattern as Poise/Crit).
+
+    Counter is a new resource, "Thorns"-style: unlike Evasion, it does
+    NOT touch resolve_skill or the incoming hit at all -- the coin
+    still lands and deals its normal damage. Instead, for each
+    non-evaded coin that lands, if the TARGET (the one getting hit)
+    currently holds Counter (count > 0), the ATTACKER (caster) takes
+    flat retaliation damage equal to Counter's potency, consuming 1
+    count per retaliating coin. Retaliation damage bypasses resistance
+    entirely, same as Rupture's bonus -- it isn't a hit of the
+    attacker's own skill's damage_type, it's the target's own reaction.
+    counter_damage is the total retaliation damage this hit incurred
+    (the caller applies it to `caster` via take_damage); counter_count
+    is how many coins triggered it, for fire_counter_triggers below
+    (mirrors evade_count/fire_evade_triggers exactly).
     """
     log: list[str] = []
     total_damage = 0
     per_coin_triggers: list[Trigger] = []
+    evade_count = 0
+    counter_damage = 0
+    counter_count = 0
     poise = caster.get_status("poise")
+    evasion = target.get_status("evasion")
+    counter = target.get_status("counter")
 
     for i, coin in enumerate(result.coin_results):
+        if coin.is_evaded:
+            evade_count += 1
+            log.append(
+                f"Coin {i + 1}: {status_emoji('evasion')} {target.name} evades the hit."
+            )
+            if evasion is not None:
+                evasion = decay_after_trigger(evasion)
+                target.set_status_instance(evasion)
+            continue
+
         per_coin_triggers.extend(coin.fired_triggers)
         raw = coin.damage_dealt + (coin.crit_bonus_damage if coin.is_crit else 0)
         resisted = apply_resistance(raw, target.resistances.get(attacker_skill.damage_type, 0))
@@ -714,11 +756,71 @@ def apply_incoming_hit(
                 f"{status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
             )
 
+        if counter is not None and counter.count > 0:
+            counter_damage += counter.potency
+            counter_count += 1
+            log.append(
+                f"Coin {i + 1}: {status_emoji('counter')} {target.name}'s Counter retaliates "
+                f"on {caster.name}: +{counter.potency} damage"
+            )
+            counter = decay_after_trigger(counter)
+            target.set_status_instance(counter)
+
         total_damage += coin_total
 
-    return total_damage, log, per_coin_triggers
+    return total_damage, log, per_coin_triggers, evade_count, counter_damage, counter_count
 
 
+def fire_evade_triggers(defender: Fighter, attacker: Fighter, battle: Battle, evade_count: int) -> list[str]:
+    """Fires [On Evade] once per coin the defender actually evaded this
+    hit (evade_count, from apply_incoming_hit above), swept across ALL
+    of the defender's own known skills -- same passive-sweep pattern as
+    fire_passive_triggers uses for [Combat Start]/[Turn Start], since
+    the defender isn't the one whose skill is being resolved right now,
+    they're reacting to someone else's attack, so there's no single
+    "current skill" of theirs to check triggers against.
+
+    caster on the context is the defender (the one who reacted), target
+    is the attacker (so a condition like "if attacker has Rupture" or
+    "if attacker has Fragile" reads naturally off the existing
+    target_status condition type). Called once per evaded coin rather
+    than once per hit, so a trigger like "[On Evade] Gain 2 Sanity"
+    correctly stacks if a multi-coin skill gets partially evaded.
+    """
+    if evade_count <= 0:
+        return []
+    log: list[str] = []
+    context = TriggerContext(caster=defender, target=attacker, battle=battle)
+    for _ in range(evade_count):
+        for skill in defender.skills.values():
+            _, post_hit = resolve_triggers(skill, context, "on_evade")
+            log.extend(apply_trigger_effects(post_hit, defender, attacker))
+    return log
+
+
+def fire_counter_triggers(defender: Fighter, attacker: Fighter, battle: Battle, counter_count: int) -> list[str]:
+    """Fires [Before Getting Hit] once per coin that triggered a Counter
+    retaliation this hit (counter_count, from apply_incoming_hit above),
+    swept across ALL of the defender's own known skills -- identical
+    pattern to fire_evade_triggers above, for the same reason (the
+    defender isn't resolving a skill of their own right now).
+
+    Same context shape as fire_evade_triggers: caster is the defender,
+    target is the attacker. The flat retaliation damage itself is
+    Counter's innate effect (handled directly in apply_incoming_hit);
+    this only fires the ADDITIONAL Conditional Trigger effects
+    (inflict_status/sanity_gain) layered on top, same relationship
+    [On Crit] has to Poise's innate crit-bonus-damage.
+    """
+    if counter_count <= 0:
+        return []
+    log: list[str] = []
+    context = TriggerContext(caster=defender, target=attacker, battle=battle)
+    for _ in range(counter_count):
+        for skill in defender.skills.values():
+            _, post_hit = resolve_triggers(skill, context, "before_getting_hit")
+            log.extend(apply_trigger_effects(post_hit, defender, attacker))
+    return log
 # Every pre-roll (pre-toss) skill-level timing, in firing order, for a
 # side that's about to enter a Clash. combat_start/turn_start used to
 # live in this list too, but only ever fired for whatever skill was
@@ -863,37 +965,57 @@ def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Figh
     return log
 
 
-class CombatRevealView(discord.ui.View):
-    """One button per resolved action from a single /battle combat call.
-    The main combat message only ever shows a one-line summary per
-    action (so it never blows past Discord's per-embed character
-    limits no matter how many clashes happen in a round) -- clicking a
-    button reveals that ONE action's full breakdown (every attrition
-    round, every coin's face, every Trigger that fired) as an ephemeral
-    reply to whoever clicked, so each player can dig into just the
-    actions they care about without dumping everything into the shared
-    channel at once.
+class CombatLogView(discord.ui.View):
+    """One button, "Full Log" -- anyone can click it to see the FULL
+    breakdown of everything that happened this Combat Phase (every
+    attrition round, every coin's face, every Trigger that fired,
+    across every action), as an ephemeral reply to whoever clicked.
+    Replaces the old per-action CombatRevealView (one button per
+    action) with a single consolidated log, per the design decision to
+    have one place to review the whole phase rather than action by
+    action.
 
-    Discord caps a single message at 25 total components, so only the
-    first 25 entries get a button -- combat() adds a footer note on the
-    embed itself if that cap gets hit.
+    Discord caps a single embed description at 4096 chars and a single
+    message at 10 embeds -- with enough actions in one round the full
+    log can genuinely blow past even that, so entries are packed into
+    as many embeds as fit (up to 10) and anything beyond that is noted
+    rather than silently dropped.
     """
 
     def __init__(self, entries: list[tuple[str, str]], timeout: float = 600):
         super().__init__(timeout=timeout)
-        for label, detail in entries[:25]:
-            self.add_item(self._make_button(label, detail))
+        self.entries = entries
 
-    @staticmethod
-    def _make_button(label: str, detail: str) -> discord.ui.Button:
-        button = discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Full Log", style=discord.ButtonStyle.secondary)
+    async def full_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.entries:
+            await interaction.response.send_message("Nothing happened this Combat Phase.", ephemeral=True)
+            return
 
-        async def callback(interaction: discord.Interaction):
-            embed = discord.Embed(title=label, description=detail[:4000], color=0x5865F2)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+        embeds: list[discord.Embed] = []
+        current_lines: list[str] = []
+        current_len = 0
 
-        button.callback = callback
-        return button
+        def flush():
+            if current_lines:
+                title = "Combat Log" if not embeds else f"Combat Log (cont. {len(embeds) + 1})"
+                embeds.append(discord.Embed(title=title, description="\n".join(current_lines)[:4000], color=0x5865F2))
+
+        for label, detail in self.entries:
+            block = f"**{label}**\n{detail}"
+            if current_lines and current_len + len(block) > 3800:
+                flush()
+                current_lines = []
+                current_len = 0
+            current_lines.append(block)
+            current_len += len(block)
+        flush()
+
+        if len(embeds) > 10:
+            embeds = embeds[:10]
+            embeds[-1].set_footer(text="Some actions this round were too numerous to include in full.")
+
+        await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
     async def on_timeout(self):
         for child in self.children:
@@ -1406,11 +1528,11 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        # This whole command can take a moment (matching, resolving,
-        # applying triggers for a whole round), so acknowledge the
-        # interaction immediately and do everything else as followups --
-        # that also lets us do the two-stage "rolling, then results"
-        # reveal below via message edits.
+        # This whole command can take a while now (animating every
+        # attrition round coin-by-coin), so acknowledge the interaction
+        # immediately and do everything else as followups -- the entire
+        # animation lives inside ONE message that gets edited repeatedly
+        # from here until the phase is done.
         await interaction.response.defer()
 
         # Fires [Combat Start] (first round of the battle only) and
@@ -1463,43 +1585,115 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         units.sort(key=unit_speed, reverse=True)
 
-        # Coin-roll flavor: show every action "in progress" first, with
-        # the animated rolling-coin icon, before any real resolution
-        # happens below -- purely cosmetic (the actual coin tosses
-        # already happened the instant resolve_skill/resolve_round_clash
-        # get called further down; this doesn't roll anything live), but
-        # it gives players something to see mid-command instead of the
-        # results just appearing instantly.
-        roll_icon = coin_roll_emoji()
-        rolling_lines = []
-        for u in units:
-            if u[0] == "clash":
-                rolling_lines.append(f"{roll_icon} {u[1]['caster'].name} vs {u[2]['caster'].name}...")
-            else:
-                rolling_lines.append(f"{roll_icon} {u[1]['caster'].name} -> {u[1]['target'].name}...")
+        # locked_lines holds everything PERMANENTLY decided so far this
+        # Combat Phase: the passive-trigger block (if any), then one
+        # one-line summary per unit as it finishes animating. It's
+        # re-rendered on every single edit below alongside whatever
+        # unit is currently mid-animation, so earlier results are never
+        # lost while later ones are still resolving -- this is what
+        # makes the whole phase feel like one continuous message rather
+        # than N separate ones (the design choice made for this
+        # rewrite: one message for the entire phase, not one per unit).
+        locked_lines: list[str] = []
+        if passive_log:
+            locked_lines.append("**Passive Triggers**\n" + "\n".join(passive_log))
 
-        rolling_embed = discord.Embed(
-            title=f"Combat Phase, Round {battle.round_number}",
-            description="\n".join(rolling_lines) if rolling_lines else "Nothing declared this round.",
+        combat_title = f"Combat Phase, Round {battle.round_number}"
+        initial_embed = discord.Embed(
+            title=combat_title,
+            description="\n\n".join(locked_lines) or "Starting Combat Phase...",
             color=0x5865F2,
         )
-        combat_message = await interaction.followup.send(embed=rolling_embed, wait=True)
-        if rolling_lines:
-            await asyncio.sleep(1.4)
+        combat_message = await interaction.followup.send(embed=initial_embed, wait=True)
 
+        async def render(live_block: str | None):
+            """Re-renders the ONE shared combat_message: every locked
+            (finished) line, plus whatever the current unit's live
+            animation looks like right now. Called constantly during
+            animation -- this is genuinely a lot of message edits for a
+            busy round (every coin face, every round, every unit), which
+            is an intentional trade-off for the full-fidelity animation
+            the user asked for over a faster but less spectacle-driven
+            reveal.
+            """
+            parts = []
+            base = "\n\n".join(locked_lines)
+            if base:
+                parts.append(base)
+            if live_block:
+                parts.append(live_block)
+            description = "\n\n".join(parts) if parts else "Nothing declared this round."
+            if len(description) > 4000:
+                description = description[-4000:]
+            embed = discord.Embed(title=combat_title, description=description, color=0x5865F2)
+            await combat_message.edit(embed=embed)
+
+        # Coin-by-coin animation is pure PRESENTATION over results that
+        # are already fully computed the instant resolve_skill/
+        # resolve_round_clash/apply_incoming_hit run below -- same
+        # principle the old "rolling" flavor message used, just carried
+        # all the way through instead of stopping after one flourish.
+        # Nothing here recomputes damage, crits, evasion, resistance,
+        # or triggers; it only controls the PACING of revealing numbers
+        # that already exist.
+        COIN_FACE_DELAY = 0.55
+        COIN_DETAIL_DELAY = 0.4
+
+        async def animate_faces(live_header: str, coin_results: list) -> str:
+            """Phase one: reveals each coin's face one at a time, rolling
+            icon first, mirroring a real Limbus clash flipping its coins
+            in sequence. Returns the finished face row.
+            """
+            n = len(coin_results)
+            revealed: list[str] = []
+            for c in coin_results:
+                pending = revealed + [coin_roll_emoji()] * (n - len(revealed))
+                await render(live_header + "\n  " + " ".join(pending))
+                await asyncio.sleep(COIN_FACE_DELAY)
+                revealed.append(coin_emoji("heads") if c.heads else coin_emoji("tails"))
+            face_line = "  " + " ".join(revealed)
+            await render(live_header + "\n" + face_line)
+            await asyncio.sleep(0.35)
+            return face_line
+
+        async def animate_power(live_header: str, face_line: str, coin_results: list) -> str:
+            """Phase two for an ATTRITION ROUND toss: once every coin's
+            face is showing, reveal each coin's running Power one at a
+            time (this is a round toss, nobody actually takes damage
+            yet -- only Power is being compared to decide who loses a
+            coin this round).
+            """
+            lines = []
+            for i, c in enumerate(coin_results, start=1):
+                lines.append(f"  Coin {i}: Power {c.power_after}")
+                await render(live_header + "\n" + face_line + "\n" + "\n".join(lines))
+                await asyncio.sleep(COIN_DETAIL_DELAY)
+            return "\n".join(lines)
+
+        async def animate_damage(live_header: str, face_line: str, coin_results: list, hit_log: list[str]) -> str:
+            """Phase two for the FINAL DECISIVE toss -- "once all the
+            coins break, it goes through the animation again for the
+            damage output one by one per coin". hit_log is the flat log
+            apply_incoming_hit already produced for this exact hit
+            (every line prefixed "Coin N:", covering resistance,
+            Crit/Rupture/status/Counter notes, and dodges) -- this
+            never recomputes anything, it just reveals those
+            already-applied lines grouped by coin, one coin at a time.
+            """
+            lines = []
+            for i in range(1, len(coin_results) + 1):
+                coin_lines = [l for l in hit_log if l.startswith(f"Coin {i}:")]
+                lines.extend(coin_lines if coin_lines else [f"Coin {i}: no additional effect"])
+                await render(live_header + "\n" + face_line + "\n" + "\n".join(lines))
+                await asyncio.sleep(COIN_DETAIL_DELAY)
+            return "\n".join(lines)
+
+        summary_lines: list[str] = []
+        full_log_entries: list[tuple[str, str]] = []
         # Tracks whether we've resolved anything yet this Combat Phase, for
         # the first_hit_of_round Trigger condition. One clash counts as a
         # single event (both sides share the same flag value).
         first_action_done = False
-
-        # Two parallel outputs per resolved action: a short one-line
-        # summary (goes straight into the main embed's description, so
-        # the message itself always stays small regardless of how many
-        # actions happened this round) and the full breakdown text (only
-        # shown if a player clicks that action's button on
-        # CombatRevealView -- see its docstring above).
-        summary_lines: list[str] = []
-        reveal_entries: list[tuple[str, str]] = []
 
         for u in units:
             if u[0] == "clash":
@@ -1507,6 +1701,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 fighter_a, fighter_b = entry_a["caster"], entry_b["caster"]
                 if not fighter_a.is_alive() or not fighter_b.is_alive():
                     continue
+
+                live_header = f"⚔️ **{fighter_a.name}** vs **{fighter_b.name}**"
+                await render(live_header)
+                await asyncio.sleep(0.3)
 
                 context_a = TriggerContext(
                     caster=fighter_a, target=fighter_b, battle=battle,
@@ -1528,6 +1726,9 @@ class BattleCog(commands.GroupCog, name="battle"):
                 )
                 first_action_done = True
 
+                # Fully resolved instantly, same as always -- everything
+                # below this point is presentation over already-decided
+                # numbers, see the animate_* helpers' docstrings above.
                 outcome = resolve_round_clash(
                     skill_a, skill_b,
                     heads_chance_a=fighter_a.heads_chance(),
@@ -1560,10 +1761,12 @@ class BattleCog(commands.GroupCog, name="battle"):
                 _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
                 _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
-                total_damage, status_log, per_coin_triggers = apply_incoming_hit(
+                total_damage, status_log, per_coin_triggers, evade_count, counter_damage, counter_count = apply_incoming_hit(
                     winner_skill, outcome.winner_final_result, loser, winner
                 )
                 loser.take_damage(total_damage)
+                if counter_damage:
+                    winner.take_damage(counter_damage)
                 trigger_log = apply_trigger_effects(
                     winner_pre_roll_post_hit + clash_win_post_hit + attack_end_post_hit
                     + turn_end_post_hit_winner + per_coin_triggers
@@ -1571,7 +1774,58 @@ class BattleCog(commands.GroupCog, name="battle"):
                     winner, loser,
                 )
                 trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
+                # [On Evade] and [Before Getting Hit] are the LOSER's own
+                # reactions -- they're the one who just got hit by the
+                # winner's final toss, see fire_evade_triggers/
+                # fire_counter_triggers for why these need their own
+                # calls rather than folding into apply_trigger_effects.
+                trigger_log += fire_evade_triggers(loser, winner, battle, evade_count)
+                trigger_log += fire_counter_triggers(loser, winner, battle, counter_count)
 
+                # ---- Animate every attrition round in full ----
+                round_summaries: list[str] = []
+                for round_idx, r in enumerate(outcome.rounds, start=1):
+                    round_header = (
+                        live_header + "\n" + "\n".join(round_summaries)
+                        + ("\n" if round_summaries else "")
+                        + f"Round {round_idx}: {fighter_a.name} ({r.coins_a_before} coins) "
+                        + f"vs {fighter_b.name} ({r.coins_b_before} coins)"
+                    )
+
+                    a_face = await animate_faces(f"{round_header}\n{fighter_a.name}:", r.result_a.coin_results)
+                    a_power = await animate_power(f"{round_header}\n{fighter_a.name}:", a_face, r.result_a.coin_results)
+                    a_block = f"{fighter_a.name}:\n{a_face}\n{a_power}"
+
+                    b_face = await animate_faces(f"{round_header}\n{a_block}\n{fighter_b.name}:", r.result_b.coin_results)
+                    b_power = await animate_power(f"{round_header}\n{a_block}\n{fighter_b.name}:", b_face, r.result_b.coin_results)
+
+                    if r.loser == "a":
+                        result_line = f"{fighter_a.name} loses a coin"
+                    elif r.loser == "b":
+                        result_line = f"{fighter_b.name} loses a coin"
+                    else:
+                        result_line = "Tie, nobody loses a coin"
+
+                    full_round_block = f"{round_header}\n{a_block}\n{fighter_b.name}:\n{b_face}\n{b_power}\n{result_line}"
+                    await render(full_round_block)
+                    await asyncio.sleep(0.6)
+
+                    round_summaries.append(
+                        f"Round {round_idx}: {fighter_a.name} Power {r.result_a.final_power} vs "
+                        f"{fighter_b.name} Power {r.result_b.final_power} -> {result_line}"
+                    )
+
+                # ---- Animate the winner's final decisive toss ----
+                final_header = (
+                    live_header + "\n" + "\n".join(round_summaries)
+                    + f"\n\n**{winner.name}'s final attack** "
+                    + f"({outcome.winner_final_result.skill.coins} coins remaining):"
+                )
+                final_face = await animate_faces(final_header, outcome.winner_final_result.coin_results)
+                await animate_damage(final_header, final_face, outcome.winner_final_result.coin_results, status_log)
+                await asyncio.sleep(0.4)
+
+                # ---- Same full detail text + one-line summary as before, for the Full Log button and locked history ----
                 field_value = format_clash_rounds(outcome, fighter_a.name, fighter_b.name)
                 field_value += (
                     f"\n\n**{winner.name}'s final attack** "
@@ -1586,16 +1840,27 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"\n{winner.name} Sanity +{SANITY_CLASH_WIN} ({winner.sanity}), "
                     f"{loser.name} Sanity -{SANITY_CLASH_LOSS} ({loser.sanity})"
                 )
+                if counter_damage:
+                    field_value += (
+                        f"\n{status_emoji('counter')} {loser.name}'s Counter hits back for "
+                        f"{counter_damage} damage. ({winner.name}: {winner.hp}/{winner.max_hp} HP)"
+                    )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
                     field_value += "\n" + "\n".join(trigger_log)
 
-                summary_lines.append(
+                summary_line = (
                     f"⚔️ **{winner.name}** beats **{loser.name}** -- {total_damage} damage "
                     f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
                 )
-                reveal_entries.append((f"{fighter_a.name} vs {fighter_b.name}", field_value))
+                summary_lines.append(summary_line)
+                full_log_entries.append((f"{fighter_a.name} vs {fighter_b.name}", field_value))
+
+                # Lock this unit's summary permanently into the message,
+                # clear the live block, and move on to the next unit.
+                locked_lines.append(summary_line)
+                await render(None)
 
             else:
                 _, entry = u
@@ -1603,6 +1868,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 target = entry["target"]
                 if not fighter.is_alive() or not target.is_alive():
                     continue
+
+                live_header = f"🗡️ **{fighter.name}** -> **{target.name}** (unopposed)"
+                await render(live_header)
+                await asyncio.sleep(0.3)
 
                 context = TriggerContext(
                     caster=fighter, target=target, battle=battle,
@@ -1621,8 +1890,12 @@ class BattleCog(commands.GroupCog, name="battle"):
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log, per_coin_triggers = apply_incoming_hit(adjusted_skill, result, target, fighter)
+                total_damage, status_log, per_coin_triggers, evade_count, counter_damage, counter_count = apply_incoming_hit(
+                    adjusted_skill, result, target, fighter
+                )
                 target.take_damage(total_damage)
+                if counter_damage:
+                    fighter.take_damage(counter_damage)
                 _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
                 _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
                 _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
@@ -1631,6 +1904,16 @@ class BattleCog(commands.GroupCog, name="battle"):
                     + turn_end_post_hit + per_coin_triggers,
                     fighter, target,
                 )
+                # [On Evade] and [Before Getting Hit] are the TARGET's
+                # own reaction to this unopposed attack.
+                trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
+                trigger_log += fire_counter_triggers(target, fighter, battle, counter_count)
+
+                # ---- Animate: no attrition rounds for an unopposed attack, straight to the decisive toss ----
+                final_header = live_header
+                final_face = await animate_faces(final_header, result.coin_results)
+                await animate_damage(final_header, final_face, result.coin_results, status_log)
+                await asyncio.sleep(0.4)
 
                 field_value = format_skill_result(result)
                 field_value += (
@@ -1638,47 +1921,45 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"({target.name}: {target.hp}/{target.max_hp} HP)"
                 )
                 field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
+                if counter_damage:
+                    field_value += (
+                        f"\n{status_emoji('counter')} {target.name}'s Counter hits back for "
+                        f"{counter_damage} damage. ({fighter.name}: {fighter.hp}/{fighter.max_hp} HP)"
+                    )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
                     field_value += "\n" + "\n".join(trigger_log)
 
-                summary_lines.append(
+                summary_line = (
                     f"🗡️ **{fighter.name}** hits **{target.name}** (unopposed) -- {total_damage} damage "
                     f"({target.name}: {target.hp}/{target.max_hp} HP)"
                 )
-                reveal_entries.append(
+                summary_lines.append(summary_line)
+                full_log_entries.append(
                     (f"{fighter.name} -> {target.name} (unopposed)", field_value)
                 )
 
-        # Same one-line-per-action pattern as the rolling embed above,
-        # now with real results instead of "rolling..." placeholders.
-        # Passive Triggers go first since they happened before any
-        # clash/attack this round (see fire_passive_triggers above).
-        description_lines = []
-        if passive_log:
-            description_lines.append("**Passive Triggers**\n" + "\n".join(passive_log))
-        if summary_lines:
-            description_lines.append("\n".join(summary_lines))
-        description = "\n\n".join(description_lines) if description_lines else "Nothing declared this round."
+                locked_lines.append(summary_line)
+                await render(None)
 
-        # Discord's embed description cap is 4096 chars -- with enough
-        # actions in one round this really could overflow, same reason
-        # CombatRevealView.__init__ caps its buttons at 25. Truncate
-        # defensively rather than let the whole edit fail outright.
+        # Everything's already locked into locked_lines as the phase
+        # went along -- this is just the final static render, no
+        # "live" block left since the last unit already locked itself in.
         footer_note = None
-        if len(description) > 4000:
-            description = description[:4000] + "\n...(truncated)"
+        final_description = "\n\n".join(locked_lines)
+        if len(final_description) > 4000:
+            final_description = final_description[:4000] + "\n...(truncated)"
             footer_note = "Some results this round were too numerous to display fully."
-        if len(reveal_entries) > 25:
+        if len(full_log_entries) > 60:
             footer_note = (
                 (footer_note + " " if footer_note else "")
-                + "Only the first 25 actions have a detail button."
+                + "Some actions this round were too numerous to include in the Full Log."
             )
 
         final_embed = discord.Embed(
-            title=f"Combat Phase, Round {battle.round_number}",
-            description=description,
+            title=f"{combat_title} -- Results",
+            description=final_description or "Nothing declared this round.",
             color=0x5865F2,
         )
         if footer_note:
@@ -1692,14 +1973,20 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         battle.start_new_round()
 
-        # The interaction was deferred and its one followup already sent
-        # (the "rolling" message) -- interaction.response is spent, so
-        # the real results EDIT that same message rather than sending a
-        # new one. Click-to-reveal buttons attach here, on the final
-        # results message, not the rolling one.
-        reveal_view = CombatRevealView(reveal_entries) if reveal_entries else None
-        await combat_message.edit(embed=final_embed, view=reveal_view)
-        await sync_battle_message(self.bot, battle)
+        # Single consolidated "Full Log" button replaces the old
+        # per-action CombatRevealView -- see CombatLogView's docstring.
+        log_view = CombatLogView(full_log_entries) if full_log_entries else None
+        await combat_message.edit(embed=final_embed, view=log_view)
+
+        # Once the whole phase is done, post the updated battle status
+        # as a FRESH message in the channel (not just a silent edit of
+        # whatever the old tracked message was, which may be scrolled
+        # far above the animation that just happened) -- and start
+        # tracking THIS new message going forward, so future declares/
+        # addfighter/etc. edit the freshest copy instead of an old one
+        # buried above a wall of combat animation.
+        status_message = await interaction.channel.send(embed=build_battle_embed(battle))
+        battle.message_id = status_message.id
 
     @app_commands.command(name="end", description="End the battle in this channel")
     async def end(self, interaction: discord.Interaction):

@@ -16,7 +16,11 @@ SANITY_DRIFT_NEGATIVE = 2
 BATTLE_TYPES = {
     "spar": {"title": "Spar", "color": 0x57F287},
     "standard": {"title": "Proelium Commune", "color": 0xFEE75C},
-    "fatal": {"title": "Proelium Fatale", "color": 0xED4245},
+    "fatal": {
+        "title": "Proelium Fatale",
+        "color": 0xED4245,
+        "image": "https://cdn.discordapp.com/attachments/670849939294912545/1542197225252462702/ProeliumFatale.gif",
+    },
 }
 
 

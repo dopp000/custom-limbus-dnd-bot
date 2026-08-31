@@ -19,6 +19,8 @@ STATUS_EMOJI_IDS: dict[str, int | None] = {
     "tremor_burst": 1538063181967130624,  # not wired to a mechanic yet, ready for when Tremor Burst is built
     "sinking": 1538063130729512962,
     "poise": 1538062820300816384,
+    "evasion": 1538065517896671252,  # uploaded as "Evade", not "Evasion" -- see _STATUS_DISPLAY_NAMES below
+    "counter": 1543225884310245406,
 }
 
 # Internal keys stay semantic (base/tails/heads) so the rest of the
@@ -81,7 +83,14 @@ def emoji_tag(display_name: str, emoji_id: int | None, animated: bool = False) -
 
 def status_emoji(status_name: str) -> str:
     key = status_name.lower()
-    return emoji_tag(status_name.capitalize(), STATUS_EMOJI_IDS.get(key))
+    # Internal status keys don't always match the emoji's actual name on
+    # Discord -- the engine calls this status "evasion" everywhere (it
+    # reads better next to poise/charge/counter), but the uploaded emoji
+    # itself is named "Evade". Only entries that DON'T just match
+    # key.capitalize() need to be listed here.
+    display_names = {"evasion": "Evade"}
+    display_name = display_names.get(key, status_name.capitalize())
+    return emoji_tag(display_name, STATUS_EMOJI_IDS.get(key))
 
 
 def coin_emoji(face: str) -> str:

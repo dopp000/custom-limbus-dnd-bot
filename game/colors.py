@@ -5,6 +5,8 @@ STATUS_COLORS = {
     "rupture": 0x82B61F,
     "sinking": 0x3195A5,
     "poise": 0x0769CE,
+    "evasion": 0x99C24D,
+    "counter": 0xC2412D,
     "charge": 0x8943A8,
 }
 

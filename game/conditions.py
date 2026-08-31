@@ -33,6 +33,21 @@ SKILL_LEVEL_TIMINGS = {
     "before attack": "before_attack",
     "on unopposed attack": "on_unopposed_attack",
     "attack end": "attack_end",
+    # [On Evade] and [Before Getting Hit] both live here, not in
+    # PER_COIN_TIMINGS, even though they're each about a single
+    # incoming coin. Both are evaluated as a passive sweep across ALL
+    # of the DEFENDER's own known skills (same pattern fire_passive_
+    # triggers uses for [Combat Start]/[Turn Start]), since the
+    # defender isn't the one whose skill is being resolved when they
+    # get attacked, so there's no coin_index of theirs to attach either
+    # to. See the Evasion-resource docstring on resolve_skill in
+    # game/skills.py, and the Counter-resource docstring on
+    # apply_incoming_hit in cogs/battle.py, for the actual mechanics
+    # these fire off of. caster on the context is the defender (the one
+    # reacting), target is the attacker, so a condition like "if
+    # attacker has Rupture" still reads naturally off target_status.
+    "on evade": "on_evade",
+    "before getting hit": "before_getting_hit",
 }
 
 # Per-coin timing tags: need a :CoinN: prefix on the line, fire once per
@@ -58,11 +73,10 @@ PER_COIN_TIMINGS = {
 
 # Recognized by name, but nothing in the engine backs them yet. Parsed so
 # the error can name the specific tag and the missing system, instead of
-# a generic "unknown tag".
-UNSUPPORTED_TIMINGS = {
-    "before getting hit": "no Counter-skill system built yet",
-    "on evade": "no Evade-skill system built yet",
-}
+# a generic "unknown tag". Empty for now -- Counter and Evade (the last
+# two items that lived here) are both built now; kept as a dict, not
+# removed entirely, so a future unbuilt timing has somewhere to go.
+UNSUPPORTED_TIMINGS = {}
 
 ALL_TIMING_LOOKUP = {**SKILL_LEVEL_TIMINGS, **PER_COIN_TIMINGS}
 
@@ -82,8 +96,12 @@ SKILL_FLAG_TAGS = {
 # thing named isn't Speed) both check against this list, anything else
 # is an unmodeled custom resource (Strider, Assist Defense, Deathrite,
 # named Identity resources, etc) and gets rejected with a clear message,
-# matching this pass's scope.
-SELF_BUFF_STATUSES = ["poise", "charge"]
+# matching this pass's scope. Evasion and Counter both work like Poise
+# (a count-based stack consumed one-per-coin), except read off the
+# DEFENDER instead of the attacker -- see the Evasion-resource
+# docstring on resolve_skill in game/skills.py, and the Counter-
+# resource docstring on apply_incoming_hit in cogs/battle.py.
+SELF_BUFF_STATUSES = ["poise", "charge", "evasion", "counter"]
 
 # Target-facing statuses, mirrors statuses.py's INFLICTABLE_STATUSES.
 # Duplicated here rather than imported so this module doesn't need to

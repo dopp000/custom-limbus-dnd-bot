@@ -79,6 +79,16 @@ class CoinResult:
     is_crit: bool = False
     crit_bonus_damage: int = 0
 
+    # True if the DEFENDER dodged this coin -- see the Evasion-resource
+    # rule on resolve_skill below. damage_dealt above is already 0 for
+    # an evaded coin (Power still climbed normally, only the hit itself
+    # was negated), and this coin never crits and never fires its
+    # on_hit-family triggers, since nothing actually landed. The real
+    # Evasion stack is consumed by the caller (apply_incoming_hit in
+    # cogs/battle.py), same deferred-mutation pattern as is_crit/Poise
+    # above -- skills.py never touches a Fighter directly.
+    is_evaded: bool = False
+
 
 @dataclass
 class SkillResult:
@@ -183,6 +193,25 @@ def resolve_skill(
     ANY crit, [On Crit - Heads Hit]/[On Crit - Tails Hit] additionally
     gate on which face it landed on, mirroring how [Heads Hit]/[Tails
     Hit] relate to [On Hit].
+
+    Evasion rule: mirrors Poise-break exactly, but read off the
+    DEFENDER (context.target) instead of the attacker, since it's a
+    reaction to being hit, not something the attacker's own skill does.
+    If context.target currently holds Evasion (count > 0), each coin in
+    this resolution checks that stack IN ORDER: as long as count
+    remains, that coin is dodged, consuming exactly 1 count. An evaded
+    coin's damage_dealt is 0 and it never Crits and never fires its own
+    on_hit-family triggers -- nothing actually landed, so none of that
+    makes sense. Power still climbs normally on a Heads regardless
+    (Evasion blocks damage, it doesn't change who wins a Clash). [Coin
+    Start] still fires even on a coin that ends up evaded, since that's
+    a pre-toss self-buff on the ATTACKER's own skill, decided before
+    evasion is even checked. [On Evade] itself is NOT fired from in
+    here -- see SKILL_LEVEL_TIMINGS["on evade"] in game/conditions.py
+    and fire_evade_triggers in cogs/battle.py, since it's swept across
+    the DEFENDER's own known skills, not tied to this skill's coins at
+    all. The real Evasion stack is consumed by the caller
+    (apply_incoming_hit), same deferred-mutation pattern as Poise.
     """
     power = skill.base_power
     coin_power = skill.coin_power
@@ -195,6 +224,12 @@ def resolve_skill(
         if poise is not None:
             poise_remaining = poise.count
             poise_potency = poise.potency
+
+    evasion_remaining = 0
+    if context is not None and context.target is not None:
+        evasion = context.target.get_status("evasion")
+        if evasion is not None:
+            evasion_remaining = evasion.count
 
     for i in range(skill.coins):
         coin_index = i + 1
@@ -217,14 +252,19 @@ def resolve_skill(
         if heads:
             power += coin_power
 
+        is_evaded = False
+        if evasion_remaining > 0:
+            is_evaded = True
+            evasion_remaining -= 1
+
         is_crit = False
         crit_bonus_damage = 0
-        if poise_remaining > 0:
+        if not is_evaded and poise_remaining > 0:
             is_crit = True
             crit_bonus_damage = poise_potency
             poise_remaining -= 1
 
-        if context is not None:
+        if context is not None and not is_evaded:
             post_toss_timings = (
                 "on_hit", "heads_hit", "tails_hit",
                 "current_coin_attack_end", "heads_attack_end", "tails_attack_end",
@@ -250,8 +290,10 @@ def resolve_skill(
                     fired_triggers.append(t)
 
         results.append(CoinResult(
-            heads=heads, power_after=power, damage_dealt=power, fired_triggers=fired_triggers,
+            heads=heads, power_after=power, damage_dealt=(0 if is_evaded else power),
+            fired_triggers=fired_triggers,
             is_crit=is_crit, crit_bonus_damage=crit_bonus_damage,
+            is_evaded=is_evaded,
         ))
 
     return SkillResult(skill=skill, coin_results=results)
