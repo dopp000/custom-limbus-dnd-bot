@@ -21,17 +21,17 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 - **Round-based Clash attrition**: both sides re-toss ALL remaining coins each
   round, lower Power loses one coin permanently, repeats until one side hits
   zero coins. The winner then makes one fresh final toss with whatever coins
-  they have left — that's the only toss that actually deals damage.
+  they have left. That's the only toss that actually deals damage.
 - **No scouting**: `/battle declare` never reveals what the enemy is bringing,
   and whether an action becomes a real Clash is only decided at `/battle
-  combat` time — it only happens if both sides' declared actions target each
+  combat` time, it only happens if both sides' declared actions target each
   other's exact slot back. If not, it resolves unopposed instead.
 - **Clash-steal**: a faster ally can take over an existing ally-vs-enemy clash
   slot, with DM approval from the ally being displaced.
 - **Conditional Triggers**: a bracket-tag natural-language syntax (e.g.
   `[On Use] If this unit's Sanity is 45+, Coin Power +1`), parsed by
   `game/conditions.py`, entered via the `/battle addskill` popup. See
-  **Trigger Syntax** below for the full reference — this is the part most
+  **Trigger Syntax** below for the full reference. This is the part most
   worth re-reading before touching `game/conditions.py`, `game/skills.py`, or
   the trigger-dispatch chain in `cogs/battle.py`'s `combat()`.
 - **Poise-break Crit**: holding Poise makes coins crit for bonus damage,
@@ -45,7 +45,7 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
   Start (`fire_passive_triggers`) but scoped per-incoming-hit instead of
   per-round.
 - **Animated Combat Phase**: `/battle combat` plays out the whole round as one
-  continuously-edited message — coin-by-coin face reveals for every attrition
+  continuously-edited message. Coin-by-coin face reveals for every attrition
   round of a Clash, then the winner's final decisive toss gets its own
   face-reveal pass followed by a real-damage reveal pass (pulled from the
   actual `apply_incoming_hit` log, so it reflects resistance/Crit/Rupture/
@@ -55,7 +55,7 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
   button (`CombatLogView`) shows the whole phase's complete breakdown as
   ephemeral embeds to whoever clicks it, chunked if long. Tuning knobs:
   `COIN_FACE_DELAY` / `COIN_DETAIL_DELAY` near the top of `combat()` in
-  `cogs/battle.py` — a busy round with several Clashes can take a couple of
+  `cogs/battle.py`, a busy round with several Clashes can take a couple of
   minutes real-time at the current pacing.
 - **Proelium Fatale GIF**: any `fatal`-type battle shows the Proelium Fatale
   GIF on its embed (`BATTLE_TYPES["fatal"]["image"]` in `game/battle.py`),
@@ -69,15 +69,15 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 |---|---|
 | `create` | Starts a battle in the channel (Spar / Standard / Fatal). One battle per channel. |
 | `addfighter` | Adds a fighter to a side, either from a saved `/character` or as a one-off. |
-| `addskill` | Takes only `fighter` — opens `AddSkillModal`, a single popup collecting name, stats (packed comma-separated: Discord caps a modal at 5 fields), per-coin statuses, and the Trigger text box. |
-| `declare` | Locks a skill into one of your slots aimed at a target's slot. No scouting — see Combat Features above. |
+| `addskill` | Takes only `fighter` opens `AddSkillModal`, a single popup collecting name, stats (packed comma-separated: Discord caps a modal at 5 fields), per-coin statuses, and the Trigger text box. |
+| `declare` | Locks a skill into one of your slots aimed at a target's slot. No scouting. see Combat Features above. |
 | `undeclare` | Clears one declared slot. |
 | `removefighter` | Removes a fighter from the battle entirely. Gated to that fighter's own owner or the admin role (`ADMIN_ROLE_ID = 1468446442430533737`) via `_can_manage_fighter`. |
-| `setstatus` | Admin/testing tool. Directly sets HP, Sanity, Speed (min+max together), resistances (comma-separated multi-set, same pattern as `/character resistance`), Power, and/or one status — whichever fields you actually pass. |
+| `setstatus` | Admin/testing tool. Directly sets HP, Sanity, Speed (min+max together), resistances (comma-separated multi-set, same pattern as `/character resistance`), Power, and/or one status, whichever fields you actually pass. |
 | `combat` | Resolves the round. See **Animated Combat Phase** above. |
 | `end` | Ends the battle in the channel. |
 
-`/battle status` was removed — the synced battle embed (`build_battle_embed`,
+`/battle status` was removed, the synced battle embed (`build_battle_embed`,
 kept current via `sync_battle_message`) already shows everything it did.
 
 ### `/character` group (`cogs/character.py`)
@@ -87,7 +87,7 @@ kept current via `sync_battle_message`) already shows everything it did.
 | `create` | New saved character, owned by whoever ran it. |
 | `list` | Lists your own saved characters. |
 | `view` | Shows a character's stats. Owner or admin only; `public:True` posts it to the channel. |
-| `edit` | Owner-or-admin. No more flat `speed` param — `speed_min`/`speed_max` must be given together (no more implicit "just speed_min alone = flat" shortcut). Command description itself says "only fill in the fields you want to change" instead of tagging every single param `(optional)`. |
+| `edit` | Owner-or-admin. No more flat `speed` param, `speed_min`/`speed_max` must be given together (no more implicit "just speed_min alone = flat" shortcut). Command description itself says "only fill in the fields you want to change" instead of tagging every single param `(optional)`. |
 | `resistance` | Owner-or-admin. Set one **or several** resistances at once: `resistance_types` and `values` are both comma-separated and line up 1:1 positionally (e.g. `resistance_types:slash,burn values:20,-10`). |
 | `delete` | Owner-or-admin. |
 | `say` | Owner-or-admin. Speaks as the character via webhook (name + avatar). |
@@ -117,11 +117,11 @@ Start`, `On Hit`, `Heads Hit`, `Tails Hit`, `Hit After Clash Win`, `Current
 Coin Attack End`, `Heads Attack End`, `Tails Attack End`, `On Crit`, `On Crit
 - Heads Hit`, `On Crit - Tails Hit`.
 
-**`UNSUPPORTED_TIMINGS` is currently empty** — every timing the parser
+**`UNSUPPORTED_TIMINGS` is currently empty**. Every timing the parser
 recognizes has real engine dispatch behind it (Counter and Evade were the
 last two to land). If I ever add a new timing name to the parser without
 wiring its dispatch too, it should go in `UNSUPPORTED_TIMINGS` with a clear
-reason string instead of silently getting accepted — that's the convention
+reason string instead of silently getting accepted, that's the convention
 I've been using for "parsed but not built yet."
 
 **Self-buff resources** (`SELF_BUFF_STATUSES`): `Poise`, `Charge`,
@@ -133,10 +133,10 @@ an unmodeled custom resource and gets rejected with a clear message.
 prefix): `Target Fixed`, `Unclashable`, `Indiscriminate`, `Clashable
 Counter`. **Known gap**: these are parsed and stored on `Skill.tags` (and
 shown in skill previews), but nothing currently reads `.tags` anywhere in
-declare/clash-matching logic — they're metadata waiting on the targeting
+declare/clash-matching logic. They're metadata waiting on the targeting
 rules that would actually enforce them.
 
-## Known Gaps (as of the last time I updated this — might drift, worth checking against the code if it matters)
+## Known Gaps (as of the last time I updated this. Might drift, worth checking against the code if it matters)
 
 - `Skill.tags` flags (`target_fixed`, `unclashable`, `indiscriminate`,
   `clashable_counter`) are stored but not enforced anywhere yet.
@@ -146,10 +146,10 @@ rules that would actually enforce them.
   similarly sweep the defender's full skill list per-incoming-hit
   (`fire_evade_triggers`/`fire_counter_triggers`) rather than needing the
   matching skill to be currently declared. This is deliberate and correct,
-  not a gap — just worth knowing the mechanism before assuming these only
+  not a gap, just worth knowing the mechanism before assuming these only
   fire off declared skills.
 - Animated combat reveal pacing (`COIN_FACE_DELAY`/`COIN_DETAIL_DELAY`) is
-  untuned beyond "verified it works" — a busy round can run long. Revisit if
+  untuned beyond "verified it works", a busy round can run long. Revisit if
   it feels too slow in real play.
 
 ## Project Structure
@@ -202,7 +202,7 @@ rules that would actually enforce them.
 ```bash
    python main.py
 ```
-Watch for `Synced N slash command(s)` in the output — `main.py` calls
+Watch for `Synced N slash command(s)` in the output `main.py` calls
 `bot.tree.sync()` on every `on_ready`, so a code change to a command's
 signature is live again as soon as the bot restarts.
 
@@ -214,14 +214,14 @@ signature is live again as soon as the bot restarts.
   `data/characters/` to `.gitignore` and running `git rm --cached -r
   data/characters/` to untrack the files already committed (they stay on
   disk locally, just stop being tracked going forward). Worth remembering:
-  that only stops FUTURE commits from including this data — anything already
+  that only stops FUTURE commits from including this data, anything already
   pushed still lives in the repo's git history and would need an actual
   history rewrite (`git filter-repo` or similar, plus a force-push) to
   really scrub. Haven't done that; deciding whether it's worth the hassle.
 - **Discord modal field limits are a real, easy-to-hit trap**: a
   `discord.ui.TextInput` label over 45 chars or placeholder over 100 chars
   makes Discord reject the ENTIRE modal with a 400, which the caller only
-  ever sees as a generic "The application did not respond" — no exception
+  ever sees as a generic "The application did not respond". No exception
   surfaces unless the command body is wrapped in an explicit try/except.
   `_check_modal_field_limits()` in `cogs/battle.py` runs once at import time
   against `AddSkillModal` specifically to catch this class of bug immediately
