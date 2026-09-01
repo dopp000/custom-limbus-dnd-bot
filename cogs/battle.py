@@ -1,4 +1,5 @@
 import asyncio
+import random
 
 import discord
 from discord.ext import commands
@@ -1367,6 +1368,17 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
+        # Indiscriminate skills hit a random enemy slot, not one the
+        # caster chooses -- whatever target_slot was typed in gets
+        # thrown out and replaced here, before it's ever validated
+        # against target_fighter.skill_slots below.
+        indiscriminate_note = ""
+        if "indiscriminate" in skill.tags:
+            target_slot = random.randint(1, target_fighter.skill_slots)
+            indiscriminate_note = (
+                f" ({skill.name} is Indiscriminate -- randomly hits Slot {target_slot})"
+            )
+
         if not (1 <= target_slot <= target_fighter.skill_slots):
             await interaction.response.send_message(
                 f"{target_fighter.name} only has skill slots 1-{target_fighter.skill_slots}.",
@@ -1380,12 +1392,28 @@ class BattleCog(commands.GroupCog, name="battle"):
         partner_info = battle.find_mutual_clash_partner(target_fighter, target_slot)
         if partner_info is not None:
             partner, partner_slot = partner_info
+            partner_action = partner.declared_actions.get(partner_slot)
+            partner_is_target_fixed = (
+                partner_action is not None and "target_fixed" in partner_action.skill.tags
+            )
             if (
                 partner is not caster
                 and partner.side == caster.side
                 and caster_speed > partner.slot_speed(partner_slot)
                 and caster_speed > target_speed
             ):
+                if partner_is_target_fixed:
+                    caster.declare_in_slot(slot, skill, target_fighter, target_slot)
+                    await interaction.response.send_message(
+                        f"{target_fighter.name}'s Slot {target_slot} is already clashing "
+                        f"{partner.name}'s **{partner_action.skill.name}**, which is Target Fixed "
+                        f"and can't be taken over. Falling through to unopposed against "
+                        f"{target_fighter.name} instead.",
+                        ephemeral=True,
+                    )
+                    await sync_battle_message(self.bot, battle)
+                    return
+
                 if partner.owner_id is None:
                     caster.declare_in_slot(slot, skill, target_fighter, target_slot)
                     await interaction.response.send_message(
@@ -1459,7 +1487,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         speed_icon = stat_emoji("speed")
         preview = (
             f"**{caster.name}**'s Slot {slot} ({speed_icon}{caster_speed}) locks in **{skill.name}** "
-            f"aimed at {target_fighter.name}'s Slot {target_slot}.\n\n"
+            f"aimed at {target_fighter.name}'s Slot {target_slot}.{indiscriminate_note}\n\n"
             f"This only becomes a Clash if {target_fighter.name} targets your Slot {slot} back with "
             f"their Slot {target_slot}. Otherwise it resolves unopposed. You won't know which until "
             f"combat actually runs.\n\n"
@@ -1558,17 +1586,24 @@ class BattleCog(commands.GroupCog, name="battle"):
             if entry["used"]:
                 continue
             match = None
-            for other in entries[i + 1:]:
-                if other["used"]:
-                    continue
-                if (
-                    other["caster"] is entry["target"]
-                    and other["target"] is entry["caster"]
-                    and other["target_slot"] == entry["slot"]
-                    and entry["target_slot"] == other["slot"]
-                ):
-                    match = other
-                    break
+            # An Unclashable skill on EITHER side forces this to resolve
+            # unopposed, even if both sides' target/target_slot would
+            # otherwise mutually match -- it never enters the clash
+            # attrition system at all.
+            if "unclashable" not in entry["skill"].tags:
+                for other in entries[i + 1:]:
+                    if other["used"]:
+                        continue
+                    if "unclashable" in other["skill"].tags:
+                        continue
+                    if (
+                        other["caster"] is entry["target"]
+                        and other["target"] is entry["caster"]
+                        and other["target_slot"] == entry["slot"]
+                        and entry["target_slot"] == other["slot"]
+                    ):
+                        match = other
+                        break
             entry["used"] = True
             if match is not None:
                 match["used"] = True
