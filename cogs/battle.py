@@ -6,7 +6,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from game.battle import (
-    Battle, Fighter, DeclaredAction, BATTLE_TYPES,
+    Battle, Fighter, BATTLE_TYPES,
     SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
@@ -195,7 +195,7 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         style=discord.TextStyle.paragraph,
         placeholder=(
             "[On Use] Coin Power +1\n"
-            ":Coin1: [On Hit] Inflict 2 Rupture Potency, 1 Count\n"
+            ":Coin1: [On Hit] Inflict Rupture Potency: 2, Count: 1\n"
             "[Target Fixed]"
         ),
         required=False,

@@ -1,5 +1,11 @@
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only for type hints below -- importing these for real would be a
+    # circular import (game.battle -> game.skills -> game.conditions).
+    from game.battle import Fighter, Battle
 
 # ---------------------------------------------------------------------------
 # Condition types
