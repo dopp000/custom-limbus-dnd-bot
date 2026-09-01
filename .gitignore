@@ -12,3 +12,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Private character data -- names, avatars, stats tied to real people
+data/
