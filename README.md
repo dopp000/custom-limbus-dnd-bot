@@ -131,15 +131,19 @@ an unmodeled custom resource and gets rejected with a clear message.
 
 **Skill-flag tags** (`SKILL_FLAG_TAGS`, own line, never take a `:CoinN:`
 prefix): `Target Fixed`, `Unclashable`, `Indiscriminate`, `Clashable
-Counter`. **Known gap**: these are parsed and stored on `Skill.tags` (and
-shown in skill previews), but nothing currently reads `.tags` anywhere in
-declare/clash-matching logic. They're metadata waiting on the targeting
-rules that would actually enforce them.
+Counter`. `Unclashable`/`Target Fixed`/`Indiscriminate` are enforced in
+`declare()`/`combat()` (`cogs/battle.py`). `Clashable Counter` is still
+just stored — see Known Gaps below.
 
 ## Known Gaps (as of the last time I updated this. Might drift, worth checking against the code if it matters)
 
-- `Skill.tags` flags (`target_fixed`, `unclashable`, `indiscriminate`,
-  `clashable_counter`) are stored but not enforced anywhere yet.
+- `Skill.tags`: `unclashable`, `target_fixed`, and `indiscriminate` are now
+  enforced (see `combat()`'s clash-matching loop and `declare()` in
+  `cogs/battle.py`). `clashable_counter` is still just stored, not
+  enforced -- Counter's engine only applies flat retaliation damage right
+  now, making it "clashable" would mean giving it a real coin toss that
+  can enter clash resolution, which is new engine work I want to nail
+  down the intended mechanic for before building blind.
 - `Combat Start`/`Turn Start` fire via a full sweep of a fighter's entire
   known skill list each round (`fire_passive_triggers` in `cogs/battle.py`),
   not tied to what's actually declared. `On Evade`/`Before Getting Hit`
