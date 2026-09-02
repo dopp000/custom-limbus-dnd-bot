@@ -70,6 +70,11 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 - **Proelium Fatale GIF**: any `fatal`-type battle shows the Proelium Fatale
   GIF on its embed (`BATTLE_TYPES["fatal"]["image"]` in `game/battle.py`),
   on creation and every subsequent embed sync.
+- **Resistance formula matches real Limbus math now**, not a flat linear
+  reduction: a weakness (negative `resistance_pct`) hits at full face value,
+  but an actual resistance is only HALF as effective as its number suggests
+  (`+50 resistance_pct` only cuts damage by 25%, not 50%). Full block now
+  needs `+200`, not `+100`. See `apply_resistance` in `game/resistances.py`.
 
 ## Command Reference
 
@@ -169,6 +174,72 @@ above for `Counter`/`Clashable Counter`, and `declare()`/`combat()` in
 - Animated combat reveal pacing (`COIN_FACE_DELAY`/`COIN_DETAIL_DELAY`) is
   untuned beyond "verified it works", a busy round can run long. Revisit if
   it feels too slow in real play.
+- **Evasion doesn't match the actual intent yet.** Right now it's a flat
+  count-based resource, if the count is high enough a fighter can dodge
+  every single coin of an attack, every round, indefinitely. That's not
+  what I want, Evasion is supposed to be something that CAN fail, not a
+  wall. Real Limbus Evade tosses its own coins alongside the incoming ones
+  and only dodges while it's still ahead on Power, so a big enough attack
+  eventually breaks through. Current implementation is a deliberate
+  simplification that's turned out too strong. Revisit this before Evasion
+  sees real play, either cap it (e.g. 1 dodge per incoming attack instead
+  of per coin) or build the real power-comparison version.
+
+## Limbus Fidelity Notes (cross-checked against the wiki's Battles page)
+
+Went through <https://limbuscompany.wiki.gg/wiki/Battles> end to end to see
+what's missing. Deliberately left out of this pass, not relevant to this
+ruleset: deployment order, offense/defense levels, unbreakable/excision
+coins, Durante, the backup system.
+
+**Real structural gaps, nothing like these exists in the engine at all:**
+
+- **Guard / Clashable Guard**: a third defense-skill type alongside Evade
+  and Counter. Rolls its own coins, generates Shield HP equal to its Final
+  Power, which absorbs damage before real HP does and disappears at end of
+  Turn. Clashable Guard is the Guard equivalent of Clashable Counter: on a
+  win it raises the target's Stagger Threshold, on a loss it reduces the
+  attacker's Final Power (mitigation, not a strike-back). Whenever this
+  gets built, damage should still come off the SAME HP-loss path as normal
+  (`Fighter.take_damage`), Shield is just an overhead pool consumed first,
+  not a separate damage formula. Reserved emoji slots already sitting in
+  `game/emojis.py`: `"shield"`, `"stagger"`.
+- **Offset**: when two Defense-type skills (Guard/Evade/Counter) end up
+  facing each other, both just cancel with no effect (unless one of them
+  is a Counter/Clashable variant). Doesn't apply yet since this engine has
+  no separate "declare a defense this turn" concept distinct from
+  attacking, everything declared is an attack right now.
+- **Attack Weight / multi-target skills**: a single skill hitting multiple
+  enemy slots at once, some skills gain conditional extra weight toward
+  low-HP or untargeted slots. This engine is strictly 1v1 per declared
+  action.
+- **`[On Kill]` / `[On Crit Kill]` / `[On Crit Kill Against Enemy]`**:
+  timings for actually defeating a target, not in `game/conditions.py`'s
+  `SKILL_LEVEL_TIMINGS` at all yet.
+- **`[Failed ■■■]` prefix**: a trigger modifier firing when a conditional
+  (like a Kill trigger) would have activated but didn't. Not present.
+- **`[Ally ■■■]` prefix**: scopes an existing timing to only fire against
+  allies (support-style effects). `[Indiscriminate]` is the closest thing
+  right now, but that's targeting, not trigger-scoping, not the same
+  thing.
+
+**Setting-specific mappings, not gaps, just noting the substitution:**
+
+- Sin Affinity isn't a thing here, status resistance already covers that
+  role.
+- E.G.O is Supermoves, this is an MHA x Project Moon server, not literal
+  Sins.
+- Corrosion: not implemented for now.
+- Skill Decks: not planned, this ruleset isn't RNG-deck-based combat.
+
+**Sketched for later, not built yet:**
+
+- **Panic / Low Morale**: apply Sinking automatically once a fighter's
+  Sanity hits -45. Reserved emoji slot: `"panic"` in `game/emojis.py`.
+- **Parts/Core damage**: for an NPC with multiple parts, each skill slot
+  represents one body part, each part gets its OWN separate resistances
+  dict instead of sharing the fighter's single one. No engine support for
+  this yet, `Fighter.resistances` is still one flat dict per fighter.
 
 ## Project Structure
 
