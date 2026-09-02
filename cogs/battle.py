@@ -6,7 +6,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from game.battle import (
-    Battle, Fighter, BATTLE_TYPES,
+    Battle, Fighter, DeclaredAction, BATTLE_TYPES,
     SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
@@ -195,7 +195,7 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         style=discord.TextStyle.paragraph,
         placeholder=(
             "[On Use] Coin Power +1\n"
-            ":Coin1: [On Hit] Inflict Rupture Potency: 2, Count: 1\n"
+            ":Coin1: [On Hit] Inflict 2 Rupture Potency, 1 Count\n"
             "[Target Fixed]"
         ),
         required=False,
@@ -641,62 +641,55 @@ async def sync_battle_message(bot: commands.Bot, battle: Battle):
 
 
 def apply_incoming_hit(
-    attacker_skill: Skill, result: SkillResult, target: Fighter, caster: Fighter
-) -> tuple[int, list[str], list[Trigger], int, int, int]:
-    """Applies each landed coin's damage/status, same as before, and now
-    also collects whichever per-coin Triggers (on_hit/heads_hit/tails_hit)
-    fired on that coin (see CoinResult.fired_triggers), so the caller can
-    hand them to apply_trigger_effects alongside the skill-level ones.
-    `result` here is always the coins that actually landed -- attrition
-    rounds during a clash never reach this function, only the final toss
-    does -- so every coin iterated below is a real hit.
+    attacker_skill: Skill, result: SkillResult, target: Fighter, caster: Fighter,
+    skip_evasion: bool = False,
+) -> tuple[int, list[str], list[Trigger], int]:
+    """Applies each landed coin's damage/status, and collects whichever
+    per-coin Triggers (on_hit/heads_hit/tails_hit) fired on that coin
+    (see CoinResult.fired_triggers), so the caller can hand them to
+    apply_trigger_effects alongside the skill-level ones. `result` here
+    is always the coins that actually landed -- attrition rounds during
+    a clash never reach this function, only the final toss does -- so
+    every coin iterated below is a real hit.
 
-    `caster` is new: needed so a Crit coin (see CoinResult.is_crit) can
-    actually consume 1 count off the caster's real Poise stack here --
-    resolve_skill only computed is_crit against a local copy, it never
-    touches the Fighter object (see its docstring in game/skills.py).
-    Crit bonus damage is folded into the SAME resistance check as the
-    coin's normal damage (it's still a hit of that skill's damage_type,
-    just a harder one), unlike Rupture's bonus below, which is the
-    TARGET's own reaction and deliberately bypasses resistance entirely.
+    `caster` is needed so a Crit coin (see CoinResult.is_crit) can
+    consume 1 count off the caster's real Poise stack here -- resolve_skill
+    only computed is_crit against a local copy, it never touches the
+    Fighter object (see its docstring in game/skills.py). Crit bonus
+    damage is folded into the SAME resistance check as the coin's
+    normal damage (still a hit of that skill's damage_type, just a
+    harder one), unlike Rupture's bonus below, which is the TARGET's
+    own reaction and deliberately bypasses resistance entirely.
 
-    Now returns three extra values: evade_count, counter_damage, and
-    counter_count.
+    Returns evade_count too: how many of this result's coins had
+    is_evaded set (computed in resolve_skill, see its Evasion docstring).
+    An evaded coin is skipped entirely -- no resistance check, no
+    Rupture, no coin status, doesn't add to total_damage -- and just
+    logs the dodge, decaying 1 count off the target's real Evasion
+    stack per dodge.
 
-    evade_count is how many of this result's coins had is_evaded set
-    (computed in resolve_skill, see its Evasion docstring). An evaded
-    coin is skipped entirely here -- no resistance check, no Rupture,
-    no coin status, doesn't add to total_damage (its damage_dealt is
-    already 0 straight out of resolve_skill) -- and just logs the
-    dodge, decaying 1 count off the target's real Evasion stack per
-    dodge (same deferred-mutation pattern as Poise/Crit).
+    skip_evasion=True bypasses the target's Evasion check entirely
+    (every coin lands as if they had none) -- used specifically for a
+    Counter skill's retaliation strike against the original attacker,
+    since Counter is explicitly meant to bypass whatever defensive
+    skills its target has active, not just deal normal damage to them.
 
-    Counter is a new resource, "Thorns"-style: unlike Evasion, it does
-    NOT touch resolve_skill or the incoming hit at all -- the coin
-    still lands and deals its normal damage. Instead, for each
-    non-evaded coin that lands, if the TARGET (the one getting hit)
-    currently holds Counter (count > 0), the ATTACKER (caster) takes
-    flat retaliation damage equal to Counter's potency, consuming 1
-    count per retaliating coin. Retaliation damage bypasses resistance
-    entirely, same as Rupture's bonus -- it isn't a hit of the
-    attacker's own skill's damage_type, it's the target's own reaction.
-    counter_damage is the total retaliation damage this hit incurred
-    (the caller applies it to `caster` via take_damage); counter_count
-    is how many coins triggered it, for fire_counter_triggers below
-    (mirrors evade_count/fire_evade_triggers exactly).
+    Note: the OLD Counter status/resource mechanic (flat retaliation
+    damage whenever the target held a "counter" status) has been
+    removed entirely -- Counter is now a Skill-level mechanic (see the
+    [Counter]/[Clashable Counter] flags and find_eligible_counter /
+    find_eligible_clashable_counter / apply_counter_redirects below),
+    not something baked into every single hit here.
     """
     log: list[str] = []
     total_damage = 0
     per_coin_triggers: list[Trigger] = []
     evade_count = 0
-    counter_damage = 0
-    counter_count = 0
     poise = caster.get_status("poise")
-    evasion = target.get_status("evasion")
-    counter = target.get_status("counter")
+    evasion = None if skip_evasion else target.get_status("evasion")
 
     for i, coin in enumerate(result.coin_results):
-        if coin.is_evaded:
+        if coin.is_evaded and not skip_evasion:
             evade_count += 1
             log.append(
                 f"Coin {i + 1}: {status_emoji('evasion')} {target.name} evades the hit."
@@ -757,19 +750,9 @@ def apply_incoming_hit(
                 f"{status_name.capitalize()}: {new_instance.potency}/{new_instance.count}"
             )
 
-        if counter is not None and counter.count > 0:
-            counter_damage += counter.potency
-            counter_count += 1
-            log.append(
-                f"Coin {i + 1}: {status_emoji('counter')} {target.name}'s Counter retaliates "
-                f"on {caster.name}: +{counter.potency} damage"
-            )
-            counter = decay_after_trigger(counter)
-            target.set_status_instance(counter)
-
         total_damage += coin_total
 
-    return total_damage, log, per_coin_triggers, evade_count, counter_damage, counter_count
+    return total_damage, log, per_coin_triggers, evade_count
 
 
 def fire_evade_triggers(defender: Fighter, attacker: Fighter, battle: Battle, evade_count: int) -> list[str]:
@@ -799,29 +782,148 @@ def fire_evade_triggers(defender: Fighter, attacker: Fighter, battle: Battle, ev
     return log
 
 
-def fire_counter_triggers(defender: Fighter, attacker: Fighter, battle: Battle, counter_count: int) -> list[str]:
-    """Fires [Before Getting Hit] once per coin that triggered a Counter
-    retaliation this hit (counter_count, from apply_incoming_hit above),
-    swept across ALL of the defender's own known skills -- identical
-    pattern to fire_evade_triggers above, for the same reason (the
-    defender isn't resolving a skill of their own right now).
+def find_eligible_counter(defender: Fighter, attacker_slot_speed: int) -> tuple[int, Skill] | None:
+    """Counter is a reactive Skill-level mechanic, not a status: any
+    skill flagged [Counter] that `defender` has DECLARED this round (in
+    ANY of their slots -- it doesn't matter which one) is a standing
+    threat against every incoming unopposed attack, all round, until it
+    fires once. Eligible if defender hasn't already used their Counter
+    this round (counter_used_this_round, reset every round in
+    Fighter.clear_declaration) AND the declared Counter skill's OWN
+    slot speed beats the attacker's slot speed. Returns the first
+    eligible (slot, skill) found in declared_actions order, or None.
 
-    Same context shape as fire_evade_triggers: caster is the defender,
-    target is the attacker. The flat retaliation damage itself is
-    Counter's innate effect (handled directly in apply_incoming_hit);
-    this only fires the ADDITIONAL Conditional Trigger effects
-    (inflict_status/sanity_gain) layered on top, same relationship
-    [On Crit] has to Poise's innate crit-bonus-damage.
+    Doesn't mark it used -- the caller (apply_counter_redirects) only
+    commits that once it actually claims this specific incoming attack,
+    since which attack claims a defender's single Counter charge
+    depends on speed-priority resolution order across the whole round,
+    not just this one comparison.
     """
-    if counter_count <= 0:
-        return []
-    log: list[str] = []
-    context = TriggerContext(caster=defender, target=attacker, battle=battle)
-    for _ in range(counter_count):
-        for skill in defender.skills.values():
-            _, post_hit = resolve_triggers(skill, context, "before_getting_hit")
-            log.extend(apply_trigger_effects(post_hit, defender, attacker))
-    return log
+    if defender.counter_used_this_round:
+        return None
+    for slot_num, action in defender.declared_actions.items():
+        if "counter" in action.skill.tags and defender.slot_speed(slot_num) > attacker_slot_speed:
+            return slot_num, action.skill
+    return None
+
+
+def find_eligible_clashable_counter(defender: Fighter) -> tuple[int, Skill] | None:
+    """Same idea as find_eligible_counter, for [Clashable Counter]. Not
+    speed-gated the way Counter is -- just needs to be declared this
+    round and not yet used (clashable_counter_used_this_round).
+    """
+    if defender.clashable_counter_used_this_round:
+        return None
+    for slot_num, action in defender.declared_actions.items():
+        if "clashable_counter" in action.skill.tags:
+            return slot_num, action.skill
+    return None
+
+
+def apply_counter_redirects(units: list, battle: Battle) -> list:
+    """Runs once, right after `units` is built and speed-sorted, BEFORE
+    any resolution happens -- transforms the list to reflect Counter and
+    Clashable Counter interceptions, so the main resolution loop further
+    down never needs to know either mechanic exists; it just sees
+    ordinary ('solo', entry) / ('clash', entry_a, entry_b) tuples,
+    exactly the shape it already handles.
+
+    Only ever touches 'solo' units -- a mutual Clash already means both
+    sides are actively fighting back, so neither reactive mechanic
+    applies there. Processes in the SAME speed order the main loop will
+    use, since both mechanics are single-use per round and which
+    incoming attack claims that single use depends on order.
+
+    Pass 1 -- Counter: for every solo unit (attacker -> defender,
+    would otherwise be unopposed), check find_eligible_counter against
+    the defender. If eligible, this unit is entirely replaced: instead
+    of the attacker's skill hitting the defender, the defender's OWN
+    Counter skill now attacks the attacker back (skip_evasion=True on
+    the eventual apply_incoming_hit call, since Counter explicitly
+    bypasses the target's defenses) -- represented here as a normal
+    'solo' unit with caster/target swapped and 'is_counter_retaliation'
+    tagged on the entry so the main loop knows to skip evasion and use
+    different flavor text. The attacker's original action never
+    resolves at all: it was redirected, not merely blocked.
+
+    Pass 2 -- Clashable Counter: for a fighter with one declared, if
+    THEIR OWN action is (still, after pass 1) a solo unit -- i.e. its
+    own declared target never clashed back -- it does NOT just resolve
+    as a normal unopposed hit. Instead, scan every OTHER solo unit for
+    one where someone else is unopposedly attacking any of this
+    fighter's OTHER slots. If found, both units are consumed and
+    replaced with a single real 'clash' unit between the Clashable
+    Counter skill and that intercepted attacker's skill. If nothing to
+    intercept, this fighter's own action simply doesn't resolve at all
+    this round (it "does not activate" -- no consumption, no effect).
+    """
+    # Pass 1: Counter.
+    pass1: list = []
+    for u in units:
+        if u[0] != "solo":
+            pass1.append(u)
+            continue
+        entry = u[1]
+        attacker, defender = entry["caster"], entry["target"]
+        attacker_slot_speed = attacker.slot_speed(entry["slot"])
+        found = find_eligible_counter(defender, attacker_slot_speed)
+        if found is None:
+            pass1.append(u)
+            continue
+        counter_slot, counter_skill = found
+        defender.counter_used_this_round = True
+        redirected_entry = {
+            "caster": defender, "skill": counter_skill, "target": attacker,
+            "slot": counter_slot, "target_slot": entry["slot"], "used": True,
+            "is_counter_retaliation": True,
+        }
+        pass1.append(("solo", redirected_entry))
+
+    # Pass 2: Clashable Counter.
+    final_units: list = []
+    consumed: set[int] = set()
+    for idx, u in enumerate(pass1):
+        if idx in consumed:
+            continue
+        if u[0] != "solo":
+            final_units.append(u)
+            continue
+        entry = u[1]
+        caster = entry["caster"]
+        if "clashable_counter" not in entry["skill"].tags:
+            final_units.append(u)
+            continue
+        found = find_eligible_clashable_counter(caster)
+        if found is None:
+            final_units.append(u)
+            continue
+
+        target_idx = None
+        for j, other in enumerate(pass1):
+            if j == idx or j in consumed:
+                continue
+            if other[0] != "solo":
+                continue
+            if other[1]["target"] is caster:
+                target_idx = j
+                break
+
+        if target_idx is None:
+            # "Does not activate" -- fizzles entirely, no consumption.
+            consumed.add(idx)
+            continue
+
+        caster.clashable_counter_used_this_round = True
+        consumed.add(idx)
+        consumed.add(target_idx)
+        intercepted_entry = pass1[target_idx][1]
+        intercepted_entry["is_clashable_counter_intercept"] = True
+        entry["is_clashable_counter_intercept"] = True
+        final_units.append(("clash", entry, intercepted_entry))
+
+    return final_units
+
+
 # Every pre-roll (pre-toss) skill-level timing, in firing order, for a
 # side that's about to enter a Clash. combat_start/turn_start used to
 # live in this list too, but only ever fired for whatever skill was
@@ -1370,8 +1472,7 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         # Indiscriminate skills hit a random enemy slot, not one the
         # caster chooses -- whatever target_slot was typed in gets
-        # thrown out and replaced here, before it's ever validated
-        # against target_fighter.skill_slots below.
+        # thrown out and replaced here, before it's ever validated.
         indiscriminate_note = ""
         if "indiscriminate" in skill.tags:
             target_slot = random.randint(1, target_fighter.skill_slots)
@@ -1588,8 +1689,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             match = None
             # An Unclashable skill on EITHER side forces this to resolve
             # unopposed, even if both sides' target/target_slot would
-            # otherwise mutually match -- it never enters the clash
-            # attrition system at all.
+            # otherwise mutually match.
             if "unclashable" not in entry["skill"].tags:
                 for other in entries[i + 1:]:
                     if other["used"]:
@@ -1619,6 +1719,13 @@ class BattleCog(commands.GroupCog, name="battle"):
             return u[1]["caster"].slot_speed(u[1]["slot"])
 
         units.sort(key=unit_speed, reverse=True)
+
+        # Transforms `units` to reflect Counter / Clashable Counter
+        # interceptions -- see apply_counter_redirects's docstring
+        # above. Must run AFTER sorting (it depends on speed-priority
+        # order) and BEFORE any resolution below, since it can replace
+        # or merge units entirely.
+        units = apply_counter_redirects(units, battle)
 
         # locked_lines holds everything PERMANENTLY decided so far this
         # Combat Phase: the passive-trigger block (if any), then one
@@ -1796,12 +1903,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
                 _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
-                total_damage, status_log, per_coin_triggers, evade_count, counter_damage, counter_count = apply_incoming_hit(
+                total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
                     winner_skill, outcome.winner_final_result, loser, winner
                 )
                 loser.take_damage(total_damage)
-                if counter_damage:
-                    winner.take_damage(counter_damage)
                 trigger_log = apply_trigger_effects(
                     winner_pre_roll_post_hit + clash_win_post_hit + attack_end_post_hit
                     + turn_end_post_hit_winner + per_coin_triggers
@@ -1809,13 +1914,11 @@ class BattleCog(commands.GroupCog, name="battle"):
                     winner, loser,
                 )
                 trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
-                # [On Evade] and [Before Getting Hit] are the LOSER's own
-                # reactions -- they're the one who just got hit by the
-                # winner's final toss, see fire_evade_triggers/
-                # fire_counter_triggers for why these need their own
-                # calls rather than folding into apply_trigger_effects.
+                # [On Evade] is the LOSER's own reaction -- they're the
+                # one who just got hit by the winner's final toss, see
+                # fire_evade_triggers for why this needs its own call
+                # rather than folding into apply_trigger_effects.
                 trigger_log += fire_evade_triggers(loser, winner, battle, evade_count)
-                trigger_log += fire_counter_triggers(loser, winner, battle, counter_count)
 
                 # ---- Animate every attrition round in full ----
                 round_summaries: list[str] = []
@@ -1862,6 +1965,12 @@ class BattleCog(commands.GroupCog, name="battle"):
 
                 # ---- Same full detail text + one-line summary as before, for the Full Log button and locked history ----
                 field_value = format_clash_rounds(outcome, fighter_a.name, fighter_b.name)
+                if entry_a.get("is_clashable_counter_intercept") or entry_b.get("is_clashable_counter_intercept"):
+                    holder = entry_a["caster"] if entry_a.get("is_clashable_counter_intercept") else entry_b["caster"]
+                    field_value = (
+                        f"⚡ {holder.name}'s Clashable Counter intercepts an unopposed attack!\n\n"
+                        + field_value
+                    )
                 field_value += (
                     f"\n\n**{winner.name}'s final attack** "
                     f"({outcome.winner_final_result.skill.coins} coins remaining):\n"
@@ -1875,11 +1984,6 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"\n{winner.name} Sanity +{SANITY_CLASH_WIN} ({winner.sanity}), "
                     f"{loser.name} Sanity -{SANITY_CLASH_LOSS} ({loser.sanity})"
                 )
-                if counter_damage:
-                    field_value += (
-                        f"\n{status_emoji('counter')} {loser.name}'s Counter hits back for "
-                        f"{counter_damage} damage. ({winner.name}: {winner.hp}/{winner.max_hp} HP)"
-                    )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
@@ -1904,7 +2008,11 @@ class BattleCog(commands.GroupCog, name="battle"):
                 if not fighter.is_alive() or not target.is_alive():
                     continue
 
-                live_header = f"🗡️ **{fighter.name}** -> **{target.name}** (unopposed)"
+                is_counter = entry.get("is_counter_retaliation", False)
+                if is_counter:
+                    live_header = f"🔁 **{fighter.name}**'s Counter redirects -> strikes **{target.name}** back!"
+                else:
+                    live_header = f"🗡️ **{fighter.name}** -> **{target.name}** (unopposed)"
                 await render(live_header)
                 await asyncio.sleep(0.3)
 
@@ -1914,7 +2022,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 )
 
                 # Full pre-roll chain -- see PRE_ROLL_SOLO_TIMINGS /
-                # _resolve_pre_roll_chain above.
+                # _resolve_pre_roll_chain above. A Counter retaliation
+                # still goes through this same chain, since it's the
+                # defender's own skill resolving normally -- the only
+                # thing special about it is skip_evasion below.
                 adjusted_skill, pre_roll_post_hit = _resolve_pre_roll_chain(
                     entry["skill"], context, PRE_ROLL_SOLO_TIMINGS
                 )
@@ -1925,24 +2036,27 @@ class BattleCog(commands.GroupCog, name="battle"):
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log, per_coin_triggers, evade_count, counter_damage, counter_count = apply_incoming_hit(
-                    adjusted_skill, result, target, fighter
+                total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
+                    adjusted_skill, result, target, fighter, skip_evasion=is_counter
                 )
                 target.take_damage(total_damage)
-                if counter_damage:
-                    fighter.take_damage(counter_damage)
-                _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
-                _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
-                _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
-                trigger_log = apply_trigger_effects(
-                    pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
-                    + turn_end_post_hit + per_coin_triggers,
-                    fighter, target,
-                )
-                # [On Evade] and [Before Getting Hit] are the TARGET's
-                # own reaction to this unopposed attack.
-                trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
-                trigger_log += fire_counter_triggers(target, fighter, battle, counter_count)
+                if is_counter:
+                    _, before_getting_hit_post = resolve_triggers(adjusted_skill, context, "before_getting_hit")
+                    trigger_log = apply_trigger_effects(before_getting_hit_post, fighter, target)
+                else:
+                    _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
+                    _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
+                    _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
+                    trigger_log = apply_trigger_effects(
+                        pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
+                        + turn_end_post_hit + per_coin_triggers,
+                        fighter, target,
+                    )
+                    # [On Evade] is the TARGET's own reaction to this
+                    # unopposed attack -- doesn't apply to a Counter
+                    # retaliation, which explicitly bypasses it
+                    # (skip_evasion=True already means evade_count is 0).
+                    trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
 
                 # ---- Animate: no attrition rounds for an unopposed attack, straight to the decisive toss ----
                 final_header = live_header
@@ -1956,24 +2070,24 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"({target.name}: {target.hp}/{target.max_hp} HP)"
                 )
                 field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
-                if counter_damage:
-                    field_value += (
-                        f"\n{status_emoji('counter')} {target.name}'s Counter hits back for "
-                        f"{counter_damage} damage. ({fighter.name}: {fighter.hp}/{fighter.max_hp} HP)"
-                    )
                 if status_log:
                     field_value += "\n" + "\n".join(status_log)
                 if trigger_log:
                     field_value += "\n" + "\n".join(trigger_log)
 
-                summary_line = (
-                    f"🗡️ **{fighter.name}** hits **{target.name}** (unopposed) -- {total_damage} damage "
-                    f"({target.name}: {target.hp}/{target.max_hp} HP)"
-                )
+                if is_counter:
+                    summary_line = (
+                        f"🔁 **{fighter.name}**'s Counter redirects and strikes **{target.name}** back "
+                        f"-- {total_damage} damage ({target.name}: {target.hp}/{target.max_hp} HP)"
+                    )
+                    full_log_entries.append((f"{fighter.name}'s Counter -> {target.name}", field_value))
+                else:
+                    summary_line = (
+                        f"🗡️ **{fighter.name}** hits **{target.name}** (unopposed) -- {total_damage} damage "
+                        f"({target.name}: {target.hp}/{target.max_hp} HP)"
+                    )
+                    full_log_entries.append((f"{fighter.name} -> {target.name} (unopposed)", field_value))
                 summary_lines.append(summary_line)
-                full_log_entries.append(
-                    (f"{fighter.name} -> {target.name} (unopposed)", field_value)
-                )
 
                 locked_lines.append(summary_line)
                 await render(None)

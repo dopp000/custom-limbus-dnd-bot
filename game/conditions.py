@@ -1,11 +1,5 @@
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    # Only for type hints below -- importing these for real would be a
-    # circular import (game.battle -> game.skills -> game.conditions).
-    from game.battle import Fighter, Battle
 
 # ---------------------------------------------------------------------------
 # Condition types
@@ -92,6 +86,7 @@ ALL_TIMING_LOOKUP = {**SKILL_LEVEL_TIMINGS, **PER_COIN_TIMINGS}
 # These live on their own line with no effect text after the tag.
 SKILL_FLAG_TAGS = {
     "clashable counter": "clashable_counter",
+    "counter": "counter",
     "target fixed": "target_fixed",
     "indiscriminate": "indiscriminate",
     "unclashable": "unclashable",
@@ -102,12 +97,17 @@ SKILL_FLAG_TAGS = {
 # thing named isn't Speed) both check against this list, anything else
 # is an unmodeled custom resource (Strider, Assist Defense, Deathrite,
 # named Identity resources, etc) and gets rejected with a clear message,
-# matching this pass's scope. Evasion and Counter both work like Poise
-# (a count-based stack consumed one-per-coin), except read off the
-# DEFENDER instead of the attacker -- see the Evasion-resource
-# docstring on resolve_skill in game/skills.py, and the Counter-
-# resource docstring on apply_incoming_hit in cogs/battle.py.
-SELF_BUFF_STATUSES = ["poise", "charge", "evasion", "counter"]
+# matching this pass's scope. Evasion works like Poise (a count-based
+# stack consumed one-per-coin), read off the DEFENDER instead of the
+# attacker -- see the Evasion-resource docstring on resolve_skill in
+# game/skills.py.
+#
+# NOTE: "counter" is deliberately NOT in this list anymore -- Counter
+# used to be a status/resource here, but it's now a Skill-level
+# mechanic instead (the [Counter] skill flag, see SKILL_FLAG_TAGS
+# above, plus find_eligible_counter/apply_counter_redirects in
+# cogs/battle.py). A skill, not a stat a caster holds.
+SELF_BUFF_STATUSES = ["poise", "charge", "evasion"]
 
 # Target-facing statuses, mirrors statuses.py's INFLICTABLE_STATUSES.
 # Duplicated here rather than imported so this module doesn't need to

@@ -91,6 +91,14 @@ class Fighter:
 
     statuses: dict[str, StatusInstance] = field(default_factory=dict)
 
+    # Round-scoped single-use flags for the two Counter-family Skill
+    # flags ([Counter] and [Clashable Counter], see SKILL_FLAG_TAGS in
+    # game/conditions.py). Both reset every round in clear_declaration
+    # below. See find_eligible_counter / find_eligible_clashable_counter
+    # / apply_counter_redirects in cogs/battle.py for how these get set.
+    counter_used_this_round: bool = False
+    clashable_counter_used_this_round: bool = False
+
     def __post_init__(self):
         if self.speed_min is None:
             self.speed_min = self.speed
@@ -219,6 +227,8 @@ class Fighter:
 
     def clear_declaration(self):
         self.declared_actions = {}
+        self.counter_used_this_round = False
+        self.clashable_counter_used_this_round = False
 
     def __str__(self):
         return f"{self.name} (HP {self.hp}/{self.max_hp}, Sanity {self.sanity}, Speed {self.speed})"
