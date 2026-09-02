@@ -70,11 +70,6 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 - **Proelium Fatale GIF**: any `fatal`-type battle shows the Proelium Fatale
   GIF on its embed (`BATTLE_TYPES["fatal"]["image"]` in `game/battle.py`),
   on creation and every subsequent embed sync.
-- **Resistance formula matches real Limbus math now**, not a flat linear
-  reduction: a weakness (negative `resistance_pct`) hits at full face value,
-  but an actual resistance is only HALF as effective as its number suggests
-  (`+50 resistance_pct` only cuts damage by 25%, not 50%). Full block now
-  needs `+200`, not `+100`. See `apply_resistance` in `game/resistances.py`.
 
 ## Command Reference
 
@@ -174,72 +169,108 @@ above for `Counter`/`Clashable Counter`, and `declare()`/`combat()` in
 - Animated combat reveal pacing (`COIN_FACE_DELAY`/`COIN_DETAIL_DELAY`) is
   untuned beyond "verified it works", a busy round can run long. Revisit if
   it feels too slow in real play.
-- **Evasion doesn't match the actual intent yet.** Right now it's a flat
-  count-based resource, if the count is high enough a fighter can dodge
-  every single coin of an attack, every round, indefinitely. That's not
-  what I want, Evasion is supposed to be something that CAN fail, not a
-  wall. Real Limbus Evade tosses its own coins alongside the incoming ones
-  and only dodges while it's still ahead on Power, so a big enough attack
-  eventually breaks through. Current implementation is a deliberate
-  simplification that's turned out too strong. Revisit this before Evasion
-  sees real play, either cap it (e.g. 1 dodge per incoming attack instead
-  of per coin) or build the real power-comparison version.
 
-## Limbus Fidelity Notes (cross-checked against the wiki's Battles page)
+## Design Divergences From Canon Limbus, and Where This Is Headed
 
-Went through <https://limbuscompany.wiki.gg/wiki/Battles> end to end to see
-what's missing. Deliberately left out of this pass, not relevant to this
-ruleset: deployment order, offense/defense levels, unbreakable/excision
-coins, Durante, the backup system.
+Cross-referenced the [Limbus wiki's Battles page](https://limbuscompany.wiki.gg/wiki/Battles)
+against what's actually built here, deliberately skipping Deployment
+Order, Offense/Defense Levels, Unbreakable/Excision Coins, Durante, and
+the Backup system -- none of those fit what this bot is for. Notes on
+what's the same, what's deliberately different, and what's still
+genuinely missing:
 
-**Real structural gaps, nothing like these exists in the engine at all:**
+**Deliberately different from canon, not gaps:**
 
-- **Guard / Clashable Guard**: a third defense-skill type alongside Evade
-  and Counter. Rolls its own coins, generates Shield HP equal to its Final
-  Power, which absorbs damage before real HP does and disappears at end of
-  Turn. Clashable Guard is the Guard equivalent of Clashable Counter: on a
-  win it raises the target's Stagger Threshold, on a loss it reduces the
-  attacker's Final Power (mitigation, not a strike-back). Whenever this
-  gets built, damage should still come off the SAME HP-loss path as normal
-  (`Fighter.take_damage`), Shield is just an overhead pool consumed first,
-  not a separate damage formula. Reserved emoji slots already sitting in
-  `game/emojis.py`: `"shield"`, `"stagger"`.
-- **Offset**: when two Defense-type skills (Guard/Evade/Counter) end up
-  facing each other, both just cancel with no effect (unless one of them
-  is a Counter/Clashable variant). Doesn't apply yet since this engine has
-  no separate "declare a defense this turn" concept distinct from
-  attacking, everything declared is an attack right now.
-- **Attack Weight / multi-target skills**: a single skill hitting multiple
-  enemy slots at once, some skills gain conditional extra weight toward
-  low-HP or untargeted slots. This engine is strictly 1v1 per declared
-  action.
-- **`[On Kill]` / `[On Crit Kill]` / `[On Crit Kill Against Enemy]`**:
-  timings for actually defeating a target, not in `game/conditions.py`'s
-  `SKILL_LEVEL_TIMINGS` at all yet.
-- **`[Failed ■■■]` prefix**: a trigger modifier firing when a conditional
-  (like a Kill trigger) would have activated but didn't. Not present.
-- **`[Ally ■■■]` prefix**: scopes an existing timing to only fire against
-  allies (support-style effects). `[Indiscriminate]` is the closest thing
-  right now, but that's targeting, not trigger-scoping, not the same
-  thing.
+- **Sin Affinity is replaced with Status Resistance.** Canon Limbus
+  Skills carry a Sin Affinity (Wrath/Lust/Sloth/etc.) on top of a
+  physical damage type, and both stack additively into the resistance
+  formula. This server doesn't use Sin Affinity at all -- the five
+  status-resistance types (Burn/Bleed/Tremor/Rupture/Sinking, see
+  `ALL_RESISTANCE_TYPES` in `game/resistances.py`) cover that role
+  instead, and only ONE resistance value ever applies to a given hit
+  (the skill's own `damage_type`), never two stacked together the way
+  canon's Sin Affinity + Physical Type combo works.
+- **E.G.O is reframed as Supermoves.** This server's setting is an MHA x
+  Project Moon crossover, so wherever canon Limbus would have E.G.O
+  Skills (Awakening/Corrosion, Sanity-and-resource-gated), the
+  equivalent concept here is a Supermove. No distinct E.G.O resource
+  system, Sanity cost formula, or Overclocking mechanic is planned to
+  be ported over as-is -- Supermoves would need their own design pass
+  whenever that's actually built, not a straight reskin of E.G.O's math.
+- **Corrosion isn't implemented.** Not planned for the near term either.
+- **No Skill Deck / pull system.** Canon Limbus draws Skills from a
+  deck (weighted by Skill Rank, refreshing once empty). This bot's
+  combat isn't built around that kind of randomness -- `/battle
+  declare` picking a known skill directly is the intended design, not a
+  placeholder for a future deck system.
+- **Evade doesn't "stay active after a clean dodge" like canon.**
+  Canon Evade, if it manages to dodge every Coin of one incoming Skill,
+  stays up and keeps evading against further attacks the same Turn.
+  Deliberately not doing that here -- Evasion is a flat Count-based
+  resource (`Gain N Evasion`, one Count consumed per dodged coin, stops
+  working once it hits 0), not something that can go on indefinitely
+  just because it's been lucky so far. This was a conscious choice, not
+  an oversight.
+- **Resistance now uses the real canon formula, asymmetric around
+  Normal.** Fixed to match the wiki's actual math: a weakness
+  (`resistance_pct` negative) scales damage linearly and fully, but an
+  actual resistance (`resistance_pct` positive) is only HALF as
+  effective per point as a weakness of the same size -- entering 20
+  now reduces damage by 10%, not 20% (see `apply_resistance` in
+  `game/resistances.py` for the derivation, checked against the wiki's
+  own worked example). Real consequence worth remembering: because of
+  that halving, no finite `resistance_pct` value ever reaches true 0
+  damage on its own -- the formula asymptotically approaches 50%
+  damage and never gets there. Canon Limbus's "Immune" tier is a
+  separate discrete `x0` value, not something reached by stacking a
+  big resistance number, and this bot doesn't have that discrete-tier
+  system, just the continuous formula. If a genuine "takes zero damage
+  of this type" case is ever needed, it'll need its own explicit
+  override rather than just cranking the percentage up.
 
-**Setting-specific mappings, not gaps, just noting the substitution:**
+**Actually on the roadmap, not built yet:**
 
-- Sin Affinity isn't a thing here, status resistance already covers that
-  role.
-- E.G.O is Supermoves, this is an MHA x Project Moon server, not literal
-  Sins.
-- Corrosion: not implemented for now.
-- Skill Decks: not planned, this ruleset isn't RNG-deck-based combat.
+- **Guard** (a full third defense-skill type alongside Evade/Counter):
+  rolls its own coins, generates Shield HP equal to Final Power, which
+  soaks damage the same as regular HP but sits as a separate overhead
+  pool that clears at the end of the Turn rather than persisting.
+  Nothing resembling Shield exists in the engine yet.
+- **Clashable Guard / Power Guard**: the Guard-family equivalent of
+  Clashable Counter -- reactively clashes against the first incoming
+  attack; winning raises the target's Stagger Threshold, losing reduces
+  the attacker's Final Power (mitigation, not a hit-back). Depends on
+  Guard/Shield existing first.
+- **Offset**: when two Defense skills end up facing each other, both
+  are simply cancelled with no effect. Not meaningful until there's a
+  real concept of "declaring a defense skill this turn" separate from
+  an attack skill, i.e. depends on Guard existing.
+- **Attack Weight / multi-target Skills**: a single Skill hitting more
+  than one enemy slot at once. Everything right now is strictly
+  one-attacker-one-target-one-slot.
+- **Kill-triggered timings**: `[On Kill]`, `[On Crit Kill]`, `[On Crit
+  Kill Against Enemy]` aren't in `conditions.py` at all yet.
+- **`[Failed ...]` trigger prefix**: fires when a conditional (like a
+  Kill) would have activated but didn't. Not present.
+- **`[Ally ...]` trigger prefix**: scopes an existing timing to only
+  fire against allies, for support-style effects. Not present --
+  `Indiscriminate` is targeting-only, this would be a trigger-scoping
+  concept instead.
+- **Panic / Low Morale**: canon's -30 SP (Low Morale) / -45 SP (Panic)
+  thresholds. Planned as something a character can eventually inflict
+  via Sinking specifically (when Sinking drives a target to -45 SP),
+  not a universal always-on system -- needs a character that actually
+  applies it before it's worth building.
+- **Parts / Core**: for a future multi-part NPC, where each of its
+  skill slots represents a distinct body part with its own separate
+  resistances (damage to a Part also damages the shared Core HP pool,
+  same relationship canon Focused Encounters use). Not built -- no
+  NPC needing it exists yet.
 
-**Sketched for later, not built yet:**
-
-- **Panic / Low Morale**: apply Sinking automatically once a fighter's
-  Sanity hits -45. Reserved emoji slot: `"panic"` in `game/emojis.py`.
-- **Parts/Core damage**: for an NPC with multiple parts, each skill slot
-  represents one body part, each part gets its OWN separate resistances
-  dict instead of sharing the fighter's single one. No engine support for
-  this yet, `Fighter.resistances` is still one flat dict per fighter.
+Emoji IDs for the four new mechanics closest to actually getting built
+(Shield, Guard, Panic, Low Morale) are already reserved as `None`
+placeholders in `STATUS_EMOJI_IDS` (`game/emojis.py`), same pattern as
+`tremor_burst` -- upload the icon and fill in the ID whenever each
+mechanic actually gets built.
 
 ## Project Structure
 
