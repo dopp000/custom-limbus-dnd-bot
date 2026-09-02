@@ -21,6 +21,14 @@ STATUS_EMOJI_IDS: dict[str, int | None] = {
     "poise": 1538062820300816384,
     "evasion": 1538065517896671252,  # uploaded as "Evade", not "Evasion" -- see _STATUS_DISPLAY_NAMES below
     "counter": 1543225884310245406,
+
+    # Reserved for mechanics discussed but not yet built (see README's
+    # design-notes section for the reasoning behind each). Same
+    # "upload later, fill in the ID" pattern as tremor_burst above --
+    # these are just icon slots, nothing reads them yet.
+    "shield": None,          # overhead HP bar for a future Guard mechanic
+    "panic": None,           # -45 SP threshold status, applies Sinking
+    "stagger": None,         # Stagger Threshold state, once built
 }
 
 # Internal keys stay semantic (base/tails/heads) so the rest of the
