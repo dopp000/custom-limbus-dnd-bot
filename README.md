@@ -39,17 +39,27 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 - **Evasion**: holding Evasion dodges incoming coins one at a time (consumed
   per dodge), firing `[On Evade]` on the defender's own known skills via
   `fire_evade_triggers`.
-- **Counter**: holding Counter lets the defender hit back on an incoming
-  coin; `[Before Getting Hit]` fires off the defender's own skill list via
-  `fire_counter_triggers`, same passive-sweep pattern as Combat Start/Turn
-  Start (`fire_passive_triggers`) but scoped per-incoming-hit instead of
-  per-round.
+- **Counter / Clashable Counter**: two distinct Skill-flag mechanics, not a
+  status/resource. `[Counter]`: declared into any slot, triggers regardless
+  of which one -- reactive, fires against any incoming unopposed attack on
+  the holder if the Counter skill's own slot speed beats the attacker's,
+  fully redirecting the attack (it never lands on its original target) and
+  striking back with the Counter skill, bypassing the attacker's Evasion
+  entirely (`skip_evasion` on `apply_incoming_hit`). Single-use per round.
+  `[Clashable Counter]`: declared normally, resolves in regular speed
+  order; if its own declared target clashes back it's just a normal Clash,
+  but if it would otherwise go unopposed, it scans the holder's OTHER slots
+  for any unopposed attack against them and forces a real Clash (full
+  attrition via `resolve_round_clash`) against that instead, or fizzles
+  with zero effect if there's nothing to intercept. Also single-use per
+  round. Both reset every round via `Fighter.clear_declaration`. See
+  `apply_counter_redirects` in `cogs/battle.py`.
 - **Animated Combat Phase**: `/battle combat` plays out the whole round as one
   continuously-edited message. Coin-by-coin face reveals for every attrition
   round of a Clash, then the winner's final decisive toss gets its own
   face-reveal pass followed by a real-damage reveal pass (pulled from the
   actual `apply_incoming_hit` log, so it reflects resistance/Crit/Rupture/
-  status/Counter exactly, not an approximation). Each unit locks into a
+  status exactly, not an approximation). Each unit locks into a
   permanent one-line summary as it finishes so earlier results never
   disappear while later ones are still animating. A single **Full Log**
   button (`CombatLogView`) shows the whole phase's complete breakdown as
@@ -118,40 +128,44 @@ Coin Attack End`, `Heads Attack End`, `Tails Attack End`, `On Crit`, `On Crit
 - Heads Hit`, `On Crit - Tails Hit`.
 
 **`UNSUPPORTED_TIMINGS` is currently empty**. Every timing the parser
-recognizes has real engine dispatch behind it (Counter and Evade were the
-last two to land). If I ever add a new timing name to the parser without
-wiring its dispatch too, it should go in `UNSUPPORTED_TIMINGS` with a clear
-reason string instead of silently getting accepted, that's the convention
-I've been using for "parsed but not built yet."
+recognizes has real engine dispatch behind it. If I ever add a new timing
+name to the parser without wiring its dispatch too, it should go in
+`UNSUPPORTED_TIMINGS` with a clear reason string instead of silently
+getting accepted, that's the convention I've been using for "parsed but
+not built yet." `Before Getting Hit` specifically fires on a `[Counter]`
+skill right after it successfully redirects and lands its retaliation
+strike -- see Combat Features above.
 
 **Self-buff resources** (`SELF_BUFF_STATUSES`): `Poise`, `Charge`,
-`Evasion`, `Counter`. These are the only things `Gain N <X>` / `At N+ <X>`
+`Evasion`. These are the only things `Gain N <X>` / `At N+ <X>`
 currently recognize as a caster-held resource; anything else named there is
 an unmodeled custom resource and gets rejected with a clear message.
+`Counter` used to be in this list but isn't a status anymore -- see
+Skill-flag tags below.
 
 **Skill-flag tags** (`SKILL_FLAG_TAGS`, own line, never take a `:CoinN:`
-prefix): `Target Fixed`, `Unclashable`, `Indiscriminate`, `Clashable
-Counter`. `Unclashable`/`Target Fixed`/`Indiscriminate` are enforced in
-`declare()`/`combat()` (`cogs/battle.py`). `Clashable Counter` is still
-just stored — see Known Gaps below.
+prefix): `Target Fixed`, `Unclashable`, `Indiscriminate`, `Counter`,
+`Clashable Counter`. All five are now enforced -- see Combat Features
+above for `Counter`/`Clashable Counter`, and `declare()`/`combat()` in
+`cogs/battle.py` for the other three.
 
 ## Known Gaps (as of the last time I updated this. Might drift, worth checking against the code if it matters)
 
-- `Skill.tags`: `unclashable`, `target_fixed`, and `indiscriminate` are now
-  enforced (see `combat()`'s clash-matching loop and `declare()` in
-  `cogs/battle.py`). `clashable_counter` is still just stored, not
-  enforced -- Counter's engine only applies flat retaliation damage right
-  now, making it "clashable" would mean giving it a real coin toss that
-  can enter clash resolution, which is new engine work I want to nail
-  down the intended mechanic for before building blind.
+- The animated visuals for a Counter redirect / Clashable Counter
+  interception (the 🔁/⚡ flavor text and log wording) are only verified at
+  the logic level so far, not eyeballed in an actual live Discord run yet.
+  Worth a real playtest before trusting the wording reads well.
+- `Skill.tags`: all five flags (`unclashable`, `target_fixed`,
+  `indiscriminate`, `counter`, `clashable_counter`) are now enforced -- see
+  Combat Features and Trigger Syntax above.
 - `Combat Start`/`Turn Start` fire via a full sweep of a fighter's entire
   known skill list each round (`fire_passive_triggers` in `cogs/battle.py`),
-  not tied to what's actually declared. `On Evade`/`Before Getting Hit`
-  similarly sweep the defender's full skill list per-incoming-hit
-  (`fire_evade_triggers`/`fire_counter_triggers`) rather than needing the
-  matching skill to be currently declared. This is deliberate and correct,
-  not a gap, just worth knowing the mechanism before assuming these only
-  fire off declared skills.
+  not tied to what's actually declared. `On Evade` works the same way
+  (`fire_evade_triggers`, full sweep). `Before Getting Hit` is different
+  now: it fires only on the ONE specific `[Counter]` skill that actually
+  redirected and landed, not a sweep. This is deliberate and correct, not
+  a gap, just worth knowing the mechanism before assuming these only fire
+  off declared skills.
 - Animated combat reveal pacing (`COIN_FACE_DELAY`/`COIN_DETAIL_DELAY`) is
   untuned beyond "verified it works", a busy round can run long. Revisit if
   it feels too slow in real play.
