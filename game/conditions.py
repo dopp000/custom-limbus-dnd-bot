@@ -48,6 +48,16 @@ SKILL_LEVEL_TIMINGS = {
     # attacker has Rupture" still reads naturally off target_status.
     "on evade": "on_evade",
     "before getting hit": "before_getting_hit",
+    # Fires on the ATTACKER's own skill, right after this hit's damage
+    # is applied, if the TARGET is now Stagger'd -- either freshly
+    # triggered by this exact hit, or already Stagger'd from an earlier
+    # hit and still qualifying. Evaluated with caster=attacker,
+    # target=defender, same as every other skill-level timing (not a
+    # defender-side passive sweep like on_evade/before_getting_hit
+    # above, since this is genuinely about the ATTACKING skill's own
+    # resolution). See Fighter.check_stagger in game/battle.py and
+    # STAGGER_MULTIPLIERS in cogs/battle.py for the actual mechanic.
+    "on stagger": "on_stagger",
 }
 
 # Per-coin timing tags: need a :CoinN: prefix on the line, fire once per

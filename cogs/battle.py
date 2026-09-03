@@ -8,6 +8,7 @@ from discord import app_commands
 from game.battle import (
     Battle, Fighter, DeclaredAction, BATTLE_TYPES,
     SANITY_PER_COIN_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
+    STAGGER_MULTIPLIERS,
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
 from game.conditions import Trigger, TriggerContext, parse_trigger_text, TriggerParseError
@@ -680,6 +681,17 @@ def apply_incoming_hit(
     [Counter]/[Clashable Counter] flags and find_eligible_counter /
     find_eligible_clashable_counter / apply_counter_redirects below),
     not something baked into every single hit here.
+
+    Stagger multiplier: if `target` is ALREADY Stagger'd (from an
+    earlier hit, current_stagger_tier > 0) when this hit lands, the
+    summed total_damage gets multiplied by STAGGER_MULTIPLIERS for
+    that tier, applied once to the total rather than per-coin (avoids
+    compounding rounding error across coins). Deliberately checked
+    BEFORE this hit's own Stagger state update -- the hit that FIRST
+    triggers Stagger does NOT get the bonus itself, only hits landing
+    WHILE already Stagger'd do. The caller is responsible for calling
+    target.check_stagger(...) AFTER this function returns and damage
+    has actually been applied via take_damage, so that ordering holds.
     """
     log: list[str] = []
     total_damage = 0
@@ -687,6 +699,10 @@ def apply_incoming_hit(
     evade_count = 0
     poise = caster.get_status("poise")
     evasion = None if skip_evasion else target.get_status("evasion")
+    stagger_multiplier = (
+        STAGGER_MULTIPLIERS[target.current_stagger_tier - 1]
+        if target.current_stagger_tier > 0 else 1.0
+    )
 
     for i, coin in enumerate(result.coin_results):
         if coin.is_evaded and not skip_evasion:
@@ -751,6 +767,14 @@ def apply_incoming_hit(
             )
 
         total_damage += coin_total
+
+    if stagger_multiplier != 1.0 and total_damage > 0:
+        boosted = round(total_damage * stagger_multiplier)
+        log.append(
+            f"{status_emoji('stagger')} {target.name} is Stagger'd (Tier "
+            f"{target.current_stagger_tier}): {total_damage} -> {boosted} damage (x{stagger_multiplier})"
+        )
+        total_damage = boosted
 
     return total_damage, log, per_coin_triggers, evade_count
 
@@ -1260,6 +1284,8 @@ class BattleCog(commands.GroupCog, name="battle"):
         speed_max="Set the high end of this fighter's Speed range (needs speed_min too, re-rolls slots)",
         power="Set Power",
         resistance_input="Resistance(s) to set: 'Type:Value', comma-separated for several, e.g. 'slash:20,burn:-10'",
+        stagger_thresholds="3 HP% values for Tier 1/2/3, comma-separated, descending, e.g. '55,40,25'",
+        stagger_disabled_tiers="Which Stagger tiers to strip, comma-separated (only 2 and/or 3 -- Tier 1 can't be removed), or 'none' to re-enable all",
     )
     @app_commands.choices(
         status_name=[app_commands.Choice(name=s.capitalize(), value=s) for s in INFLICTABLE_STATUSES]
@@ -1279,6 +1305,8 @@ class BattleCog(commands.GroupCog, name="battle"):
         speed_max: int | None = None,
         power: int | None = None,
         resistance_input: str | None = None,
+        stagger_thresholds: str | None = None,
+        stagger_disabled_tiers: str | None = None,
     ):
         battle = self.battles.get(interaction.channel_id)
         if battle is None:
@@ -1332,6 +1360,61 @@ class BattleCog(commands.GroupCog, name="battle"):
                     return
                 resistance_changes.append((r_type, r_value))
 
+        # Same up-front, all-or-nothing validation pattern as resistances
+        # above -- parsed and checked before anything gets mutated.
+        parsed_stagger_thresholds: list[float] | None = None
+        if stagger_thresholds is not None:
+            parts = [p.strip() for p in stagger_thresholds.split(",")]
+            if len(parts) != 3:
+                await interaction.response.send_message(
+                    "stagger_thresholds needs exactly 3 comma-separated values (Tier 1/2/3), "
+                    "e.g. '55,40,25'.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                pct_values = [int(p) for p in parts]
+            except ValueError:
+                await interaction.response.send_message(
+                    "stagger_thresholds values must be whole numbers (percentages).",
+                    ephemeral=True,
+                )
+                return
+            if not (pct_values[0] > pct_values[1] > pct_values[2]):
+                await interaction.response.send_message(
+                    f"stagger_thresholds must be strictly descending (Tier 1 > Tier 2 > Tier 3), "
+                    f"got {pct_values[0]}, {pct_values[1]}, {pct_values[2]}.",
+                    ephemeral=True,
+                )
+                return
+            parsed_stagger_thresholds = [v / 100 for v in pct_values]
+
+        parsed_disabled_tiers: set[int] | None = None
+        if stagger_disabled_tiers is not None:
+            if stagger_disabled_tiers.strip().lower() == "none":
+                parsed_disabled_tiers = set()
+            else:
+                try:
+                    parsed_disabled_tiers = {
+                        int(t.strip()) for t in stagger_disabled_tiers.split(",") if t.strip()
+                    }
+                except ValueError:
+                    await interaction.response.send_message(
+                        "stagger_disabled_tiers must be whole numbers (2 and/or 3), or 'none'.",
+                        ephemeral=True,
+                    )
+                    return
+                if 1 in parsed_disabled_tiers:
+                    await interaction.response.send_message(
+                        "Tier 1 Stagger can never be removed.", ephemeral=True
+                    )
+                    return
+                if not parsed_disabled_tiers.issubset({2, 3}):
+                    await interaction.response.send_message(
+                        "stagger_disabled_tiers can only contain 2 and/or 3.", ephemeral=True
+                    )
+                    return
+
         changes = []
 
         if status_name is not None:
@@ -1371,6 +1454,23 @@ class BattleCog(commands.GroupCog, name="battle"):
         for r_type, r_value in resistance_changes:
             target_fighter.resistances[r_type] = r_value
             changes.append(f"{r_type.capitalize()} resistance -> {r_value}%")
+
+        if parsed_stagger_thresholds is not None:
+            target_fighter.stagger_thresholds = parsed_stagger_thresholds
+            changes.append(
+                f"Stagger thresholds -> {pct_values[0]}%/{pct_values[1]}%/{pct_values[2]}%"
+            )
+
+        if parsed_disabled_tiers is not None:
+            target_fighter.stagger_tiers_enabled = [
+                True,
+                2 not in parsed_disabled_tiers,
+                3 not in parsed_disabled_tiers,
+            ]
+            enabled_desc = ", ".join(
+                f"Tier {t}" for t in (1, 2, 3) if t not in parsed_disabled_tiers
+            )
+            changes.append(f"Stagger tiers active -> {enabled_desc}")
 
         if not changes:
             await interaction.response.send_message(
@@ -1911,10 +2011,14 @@ class BattleCog(commands.GroupCog, name="battle"):
                     winner_skill, outcome.winner_final_result, loser, winner
                 )
                 loser.take_damage(total_damage)
+                loser.check_stagger(battle.round_number)
+                stagger_post_hit: list[Trigger] = []
+                if loser.current_stagger_tier > 0:
+                    _, stagger_post_hit = resolve_triggers(winner_skill, winner_context, "on_stagger")
                 trigger_log = apply_trigger_effects(
                     winner_pre_roll_post_hit + clash_win_post_hit + attack_end_post_hit
                     + turn_end_post_hit_winner + per_coin_triggers
-                    + outcome.winner_before_attack_post_hit,
+                    + outcome.winner_before_attack_post_hit + stagger_post_hit,
                     winner, loser,
                 )
                 trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
@@ -2044,16 +2148,20 @@ class BattleCog(commands.GroupCog, name="battle"):
                     adjusted_skill, result, target, fighter, skip_evasion=is_counter
                 )
                 target.take_damage(total_damage)
+                target.check_stagger(battle.round_number)
+                stagger_post_hit: list[Trigger] = []
+                if target.current_stagger_tier > 0:
+                    _, stagger_post_hit = resolve_triggers(adjusted_skill, context, "on_stagger")
                 if is_counter:
                     _, before_getting_hit_post = resolve_triggers(adjusted_skill, context, "before_getting_hit")
-                    trigger_log = apply_trigger_effects(before_getting_hit_post, fighter, target)
+                    trigger_log = apply_trigger_effects(before_getting_hit_post + stagger_post_hit, fighter, target)
                 else:
                     _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
                     _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
                     _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
                     trigger_log = apply_trigger_effects(
                         pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
-                        + turn_end_post_hit + per_coin_triggers,
+                        + turn_end_post_hit + per_coin_triggers + stagger_post_hit,
                         fighter, target,
                     )
                     # [On Evade] is the TARGET's own reaction to this
@@ -2123,6 +2231,12 @@ class BattleCog(commands.GroupCog, name="battle"):
         # this flips permanently so they never fire again in later rounds
         # of the same battle.
         battle.started = True
+
+        # Clear any Stagger whose expiry round has now been reached --
+        # must happen BEFORE start_new_round() bumps round_number, since
+        # clear_expired_stagger checks against the round that's ENDING.
+        for f in battle.fighters:
+            f.clear_expired_stagger(battle.round_number)
 
         battle.start_new_round()
 

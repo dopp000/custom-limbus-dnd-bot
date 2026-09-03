@@ -17,6 +17,17 @@ SANITY_PER_HEADS_UNOPPOSED = 2
 SANITY_DRIFT_POSITIVE = 4
 SANITY_DRIFT_NEGATIVE = 2
 
+# Default Stagger thresholds as HP% (Tier 1 = mildest/first crossed as
+# HP drops, Tier 3 = harshest/last crossed), and the incoming-damage
+# multiplier each tier applies WHILE active. Both are per-character
+# customizable (Fighter.stagger_thresholds / stagger_tiers_enabled),
+# these are just the defaults a Fighter starts with. See
+# Fighter.check_stagger below for the actual detection/duration logic,
+# and STAGGER_MULTIPLIERS' use in apply_incoming_hit (cogs/battle.py)
+# for where the multiplier actually gets applied.
+DEFAULT_STAGGER_THRESHOLDS = [0.55, 0.40, 0.25]
+STAGGER_MULTIPLIERS = [1.5, 2.0, 2.5]
+
 BATTLE_TYPES = {
     "spar": {"title": "Spar", "color": 0x57F287},
     "standard": {"title": "Proelium Commune", "color": 0xFEE75C},
@@ -103,6 +114,21 @@ class Fighter:
     counter_used_this_round: bool = False
     clashable_counter_used_this_round: bool = False
 
+    # Stagger. stagger_thresholds is 3 HP% values (Tier 1/2/3, in that
+    # order -- descending, Tier 1 is the highest/mildest/first crossed).
+    # stagger_tiers_enabled marks which of the 3 actually exist for this
+    # character -- Tier 1 (index 0) should never be set False (nothing
+    # enforces that here, it's a character-creation rule, see the
+    # Stagger tier trade-off in the README). current_stagger_tier is 0
+    # when not Stagger'd, else 1/2/3. stagger_clears_end_of_round is the
+    # LAST battle.round_number this Stagger is still active for --
+    # cleared once that round's combat() finishes, see the clearing
+    # logic in combat() itself.
+    stagger_thresholds: list[float] = field(default_factory=lambda: list(DEFAULT_STAGGER_THRESHOLDS))
+    stagger_tiers_enabled: list[bool] = field(default_factory=lambda: [True, True, True])
+    current_stagger_tier: int = 0
+    stagger_clears_end_of_round: int | None = None
+
     def __post_init__(self):
         if self.speed_min is None:
             self.speed_min = self.speed
@@ -174,6 +200,61 @@ class Fighter:
 
     def take_damage(self, amount: int):
         self.hp = max(0, self.hp - amount)
+
+    def check_stagger(self, current_round: int) -> int:
+        """Checks current HP% against every ENABLED Stagger threshold and
+        updates current_stagger_tier / stagger_clears_end_of_round if the
+        deepest currently-qualifying tier is at least as deep as this
+        fighter's existing tier (refreshing duration either way, even if
+        the tier itself doesn't change -- taking more damage while
+        already Stagger'd at that depth still resets the clock). Call
+        this AFTER applying a hit's damage via take_damage, not before.
+
+        Each tier's threshold is checked independently (hp_pct <=
+        threshold), not as a sequential crossing -- so disabling Tier 2
+        doesn't block Tier 3 from triggering on its own if HP drops low
+        enough, it just means the milder Tier 2 penalty is skipped for
+        HP in that in-between range (Tier 1 still applies there instead,
+        since its own threshold is still satisfied).
+
+        Returns the tier now active (0 if none, unchanged from before if
+        nothing new qualifies).
+        """
+        if self.max_hp <= 0:
+            return self.current_stagger_tier
+
+        hp_pct = self.hp / self.max_hp
+        deepest = 0
+        for i, threshold in enumerate(self.stagger_thresholds):
+            if not self.stagger_tiers_enabled[i]:
+                continue
+            if hp_pct <= threshold:
+                deepest = i + 1
+
+        if deepest > 0 and deepest >= self.current_stagger_tier:
+            self.current_stagger_tier = deepest
+            # Tier 1 clears by the end of THIS round; Tier 2/3 persist
+            # through one full extra round, clearing at the end of the
+            # NEXT round instead.
+            self.stagger_clears_end_of_round = (
+                current_round if deepest == 1 else current_round + 1
+            )
+
+        return self.current_stagger_tier
+
+    def clear_expired_stagger(self, ending_round: int):
+        """Called once, at the end of a round's combat() resolution
+        (right before battle.round_number increments), for every living
+        fighter. Clears this fighter's Stagger if its stored expiry
+        round has been reached.
+        """
+        if (
+            self.current_stagger_tier > 0
+            and self.stagger_clears_end_of_round is not None
+            and self.stagger_clears_end_of_round <= ending_round
+        ):
+            self.current_stagger_tier = 0
+            self.stagger_clears_end_of_round = None
 
     def gain_sanity(self, amount: int):
         self.sanity = min(SANITY_MAX, self.sanity + amount)
