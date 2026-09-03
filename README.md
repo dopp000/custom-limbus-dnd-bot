@@ -54,6 +54,32 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
   with zero effect if there's nothing to intercept. Also single-use per
   round. Both reset every round via `Fighter.clear_declaration`. See
   `apply_counter_redirects` in `cogs/battle.py`.
+- **Stagger**: up to 3 HP% thresholds per fighter (`Fighter.stagger_thresholds`,
+  default 55%/40%/25% for Tier 1/2/3, Tier 1 highest/mildest/first
+  crossed as HP drops, Tier 3 lowest/harshest/last crossed), checked via
+  `Fighter.check_stagger()` right after damage lands. Each ENABLED
+  tier's threshold is checked independently against current HP% (not a
+  sequential crossing), and the DEEPEST tier reached becomes the active
+  one -- if a tier is disabled (`Fighter.stagger_tiers_enabled`), HP in
+  its range falls back to whichever shallower tier is still enabled
+  instead of skipping Stagger entirely. While staggered, the NEXT
+  incoming hit's total damage gets multiplied (`STAGGER_MULTIPLIERS`:
+  1.5x/2.0x/2.5x for Tier 1/2/3) -- checked BEFORE this hit's own
+  Stagger state updates, so the hit that first triggers Stagger doesn't
+  get the bonus itself, only hits landing while ALREADY staggered do.
+  Tier 1 clears at the end of the same round it triggers; Tier 2/3
+  persist through one full extra round, clearing at the end of the
+  NEXT round instead (`Fighter.clear_expired_stagger`, called in
+  `combat()` right before `start_new_round()`). `[On Stagger]` fires on
+  the ATTACKER's own skill right after damage lands if the target is
+  now staggered, freshly or still. Thresholds and which tiers are
+  enabled are settable per fighter via `/battle setstatus`
+  (`stagger_thresholds`, `stagger_disabled_tiers` -- Tier 1 can never
+  be disabled, enforced at validation time). Not yet wired into an
+  actual Build Point purchase system (see Character Creation below --
+  Build Points aren't built as commands anywhere yet), tier removal is
+  just a directly-settable admin/testing flag for now, same as every
+  other stat this bot lets you set directly.
 - **Animated Combat Phase**: `/battle combat` plays out the whole round as one
   continuously-edited message. Coin-by-coin face reveals for every attrition
   round of a Clash, then the winner's final decisive toss gets its own
@@ -83,7 +109,7 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
 | `declare` | Locks a skill into one of your slots aimed at a target's slot. No scouting. see Combat Features above. |
 | `undeclare` | Clears one declared slot. |
 | `removefighter` | Removes a fighter from the battle entirely. Gated to that fighter's own owner or the admin role (`ADMIN_ROLE_ID = 1468446442430533737`) via `_can_manage_fighter`. |
-| `setstatus` | Admin/testing tool. Directly sets HP, Sanity, Speed (min+max together), resistances (comma-separated multi-set, same pattern as `/character resistance`), Power, and/or one status, whichever fields you actually pass. |
+| `setstatus` | Admin/testing tool. Directly sets HP, Sanity, Speed (min+max together), resistances (comma-separated multi-set, same pattern as `/character resistance`), Power, Stagger thresholds/which-tiers-are-enabled, and/or one status, whichever fields you actually pass. |
 | `combat` | Resolves the round. See **Animated Combat Phase** above. |
 | `end` | Ends the battle in the channel. |
 
@@ -120,7 +146,7 @@ lines ignored.
 **Skill-level timings** (`SKILL_LEVEL_TIMINGS`, no `:CoinN:` prefix): `Turn
 Start`, `Combat Start`, `Turn End`, `Before Use`, `On Use`, `Clash Start`,
 `Clash Win`, `Clash Lose`, `Before Attack`, `On Unopposed Attack`, `Attack
-End`, `On Evade`, `Before Getting Hit`.
+End`, `On Evade`, `Before Getting Hit`, `On Stagger`.
 
 **Per-coin timings** (`PER_COIN_TIMINGS`, need a `:CoinN:` prefix): `Coin
 Start`, `On Hit`, `Heads Hit`, `Tails Hit`, `Hit After Clash Win`, `Current
@@ -255,15 +281,6 @@ genuinely missing:
   fire against allies, for support-style effects. Not present --
   `Indiscriminate` is targeting-only, this would be a trigger-scoping
   concept instead.
-- **Stagger Thresholds + `[On Stagger]`**: up to 3 HP% thresholds
-  (default 25/40/55%, adjustable per character) that trigger Stagger
-  when crossed. `[On Stagger]` fires when the target gets Staggered on
-  this hit, OR is already Staggered. Tier 1 is permanent and can never
-  be removed from a character. Tiers 2/3 can be paid off during
-  character creation (see Character Creation below) -- removing a tier
-  means that checkpoint stops existing for that character entirely,
-  never triggers again, in any fight. Not built at all yet -- no
-  Stagger concept exists in the engine currently.
 - **Panic / Low Morale**: -30 SP (Low Morale) / -45 SP (Panic)
   thresholds. Default behavior once built: Panic makes the target
   unable to act for that Turn. Both effects need to be turn-limited by
