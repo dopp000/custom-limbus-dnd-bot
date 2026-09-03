@@ -255,22 +255,125 @@ genuinely missing:
   fire against allies, for support-style effects. Not present --
   `Indiscriminate` is targeting-only, this would be a trigger-scoping
   concept instead.
-- **Panic / Low Morale**: canon's -30 SP (Low Morale) / -45 SP (Panic)
-  thresholds. Planned as something a character can eventually inflict
-  via Sinking specifically (when Sinking drives a target to -45 SP),
-  not a universal always-on system -- needs a character that actually
-  applies it before it's worth building.
+- **Stagger Thresholds + `[On Stagger]`**: up to 3 HP% thresholds
+  (default 25/40/55%, adjustable per character) that trigger Stagger
+  when crossed. `[On Stagger]` fires when the target gets Staggered on
+  this hit, OR is already Staggered. Tier 1 is permanent and can never
+  be removed from a character. Tiers 2/3 can be paid off during
+  character creation (see Character Creation below) -- removing a tier
+  means that checkpoint stops existing for that character entirely,
+  never triggers again, in any fight. Not built at all yet -- no
+  Stagger concept exists in the engine currently.
+- **Panic / Low Morale**: -30 SP (Low Morale) / -45 SP (Panic)
+  thresholds. Default behavior once built: Panic makes the target
+  unable to act for that Turn. Both effects need to be turn-limited by
+  design -- they should NOT permanently apply stat buffs/debuffs just
+  because a character panics or drops to Low Morale again later; the
+  effect should expire and need to be reapplied, not stack into a
+  permanent state change. Also needs a customization layer similar to
+  canon's [Panic Type Changing Effects](https://limbuscompany.wiki.gg/wiki/Status_Effects)
+  -- both for a Sinking-user inflicting it on someone else, and for a
+  character who can gain Panic/Low Morale themselves needing their own
+  version of how it behaves. Not built yet.
 - **Parts / Core**: for a future multi-part NPC, where each of its
   skill slots represents a distinct body part with its own separate
   resistances (damage to a Part also damages the shared Core HP pool,
   same relationship canon Focused Encounters use). Not built -- no
   NPC needing it exists yet.
+- **A real guide for converting a Limbus-style passive into this bot's
+  Conditional Trigger syntax.** The Trigger Syntax section above
+  documents the mechanical grammar, but there's no worked-examples
+  guide yet for going the other direction -- "here's a real Limbus kit
+  passive, here's how you'd actually write that as `[Timing]
+  condition, effect` lines." Worth writing once there's a backlog of
+  real characters to draw examples from.
 
-Emoji IDs for the four new mechanics closest to actually getting built
-(Shield, Guard, Panic, Low Morale) are already reserved as `None`
-placeholders in `STATUS_EMOJI_IDS` (`game/emojis.py`), same pattern as
-`tremor_burst` -- upload the icon and fill in the ID whenever each
-mechanic actually gets built.
+**Confirmed already true, not a gap:** Sanity can never be set to a
+nonzero value at battle start through any normal command -- `Fighter.sanity`
+defaults to 0 and `/battle addfighter` has no Sanity parameter at all. The
+only way a fighter's Sanity differs from 0 at the start of Round 1 is a
+passive that explicitly says so (e.g. "if User X is present, heal 5 SP on
+Turn Start", via `fire_passive_triggers`), never a flat override. `/battle
+setstatus` can still manually set Sanity as the admin/testing tool it's
+always been -- that's a deliberate escape hatch, not a loophole in the rule.
+
+Emoji IDs for Shield, Panic, and Low Morale (Panic and Low Morale share one
+icon) are filled in now in `STATUS_EMOJI_IDS` (`game/emojis.py`) even
+though the mechanics themselves aren't built yet. `guard` is still a
+`None` placeholder, same pattern as `tremor_burst` -- upload the icon and
+fill in the ID whenever Guard actually gets built.
+
+## Character Creation & Progression (Level 1)
+
+Design notes for the leveling system -- a Level 1 character here is an MHA
+hero-university student with no hero license yet. None of this is built
+into the bot as commands/validation right now, it's the target ruleset
+`/character create`/`edit` should eventually enforce or at least help
+check against.
+
+**Two separate Build Point pools**: Stat Points and Skill Points, spent
+independently.
+
+Stat Points cover: HP, Speed range (max 8 wide), and Stagger -- both the
+HP% position of each of the 3 Stagger thresholds AND whether a character
+even keeps all 3.
+
+**Stagger tier trade-off** (this is the one worth remembering in detail,
+since it's a real strategic choice, not just a stat dump): every
+character has all 3 Stagger checkpoints active by default, meaning up to
+3 separate Staggers in one fight. Tier 1 is a guaranteed, permanent part
+of every kit -- it can never be paid off. Tiers 2 and 3 CAN be stripped
+for good using Build Points: remove Tier 3 and you never eat its harsh
+2.5x penalty again, only the milder Tier 1/2 multipliers (1.5x/2.0x).
+Remove both Tier 2 and Tier 3 and Tier 1 is the only Stagger that
+character will ever face, in any fight. Duration is the other half of the
+trade-off: Tier 1 clears by the end of the same Turn it triggers. Tiers 2
+and 3, if kept, persist through one full extra Turn -- they don't clear
+until the END of the NEXT Turn. Paying Build Points to strip a tier isn't
+just "remove a downside," it's "spend upfront to guarantee you only ever
+face the mild, same-turn version of Stagger."
+
+**Sanity, in combat** (already matches the actual code in
+`game/battle.py`/`cogs/battle.py` as of this writing -- if these two ever
+drift apart, the code is the bug):
+
+| Event | Change |
+|---|---|
+| Win a Clash | +2 SP per coin in the winning skill |
+| Unopposed attack | +2 SP per coin that flips Heads, +0 for Tails |
+| Lose a Clash | -3 SP flat, ignores the floor below (can push a low positive into negative) |
+| Turn end, while positive | -4 SP, floored at 0 (never overshoots into negative) |
+| Turn end, while negative | +2 SP, capped at 0 (recovering out of negative is slower than falling into it) |
+
+**Character creation rules:**
+
+- No single stat above 40% of the character's total BP pool.
+- Power + Speed combined, 60% of the BP pool or less.
+- Power + HP combined, 60% of the BP pool or less.
+- Maximum 2 Status Effect Archetypes.
+- Maximum 2 Defense Skill Archetypes.
+- Status resistance refund capped at 6 BP total.
+- Stagger Tier 1 can never be removed (see Stagger tier trade-off above).
+
+**Pacing**: battles are meant to run at least 4-6 Turns for a non-serious
+(spar-weight) fight, longer for anything actually serious.
+
+**Point economy**: Build Points are earned through literacy training
+(with weekly caps) and through participating in events -- not something
+handed out freely or all at once.
+
+**Still an open design question, not decided yet**: how "Power" itself
+should actually work. Specifically still unresolved: how Base/Coin/Final
+Power values should scale against character level and desired damage
+output; how much Power budget a mid-battle skill should trade away for
+carrying a status effect, and how that trade should scale; the Build
+Point (or Sanity/self-debuff/limited-use) cost of building a Supermove
+(this server's E.G.O-equivalent, see Design Divergences above) and what
+real drawbacks (Sanity loss, a self-debuff, capped uses per battle) should
+gate a strong one; and the cost of attaching extra skill tags or
+amplifications on top of a base skill. None of this has concrete numbers
+yet -- worth a dedicated design pass before it's treated as settled,
+rather than inventing figures for it here.
 
 ## Project Structure
 
