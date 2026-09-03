@@ -21,14 +21,15 @@ STATUS_EMOJI_IDS: dict[str, int | None] = {
     "poise": 1538062820300816384,
     "evasion": 1538065517896671252,  # uploaded as "Evade", not "Evasion" -- see _STATUS_DISPLAY_NAMES below
     "counter": 1543225884310245406,
-
-    # Reserved for mechanics discussed but not yet built (see README's
-    # design-notes section for the reasoning behind each). Same
-    # "upload later, fill in the ID" pattern as tremor_burst above --
-    # these are just icon slots, nothing reads them yet.
-    "shield": None,          # overhead HP bar for a future Guard mechanic
-    "panic": None,           # -45 SP threshold status, applies Sinking
-    "stagger": None,         # Stagger Threshold state, once built
+    # Same "reserved, not wired to a mechanic yet" pattern as tremor_burst
+    # above -- upload the icon and fill in the ID whenever the matching
+    # system actually gets built (see README's Roadmap section).
+    "shield": 1544679323192266904,   # for Guard's Shield HP, once Guard exists
+    "guard": None,                    # the Guard skill type itself, once it exists
+    # Panic and Low Morale intentionally share one icon -- same as how
+    # they share design (see README) -- rather than needing two uploads.
+    "panic": 1544676724862623834,
+    "low_morale": 1544676724862623834,
 }
 
 # Internal keys stay semantic (base/tails/heads) so the rest of the
@@ -50,7 +51,7 @@ DAMAGE_TYPE_EMOJI_IDS: dict[str, int | None] = {
 STAT_EMOJI_IDS: dict[str, int | None] = {
     "speed": 1538062414665486457,
     "hp": 1538062502896607232,
-    "sanity": 1538076170296238182,
+    "sanity": 1544677030245703771,
 }
 _STAT_DISPLAY_NAMES = {"speed": "SPEED", "hp": "HP", "sanity": "Sanity"}
 

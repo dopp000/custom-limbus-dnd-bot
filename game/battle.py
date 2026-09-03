@@ -7,9 +7,13 @@ from game.resistances import DEFAULT_RESISTANCES
 SANITY_MIN = -45
 SANITY_MAX = 45
 
-SANITY_CLASH_WIN = 5
-SANITY_CLASH_LOSS = 5
-SANITY_PER_HEADS_UNOPPOSED = 1
+# Clash win is +2 SP PER COIN in the winner's winning skill (variable,
+# not flat -- see SANITY_PER_COIN_CLASH_WIN below, applied against
+# outcome.winner_final_result.skill.coins by the caller in
+# cogs/battle.py). Clash loss and the unopposed-Heads bonus stay flat.
+SANITY_PER_COIN_CLASH_WIN = 2
+SANITY_CLASH_LOSS = 3
+SANITY_PER_HEADS_UNOPPOSED = 2
 SANITY_DRIFT_POSITIVE = 4
 SANITY_DRIFT_NEGATIVE = 2
 

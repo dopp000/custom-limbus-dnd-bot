@@ -7,7 +7,7 @@ from discord import app_commands
 
 from game.battle import (
     Battle, Fighter, DeclaredAction, BATTLE_TYPES,
-    SANITY_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
+    SANITY_PER_COIN_CLASH_WIN, SANITY_CLASH_LOSS, SANITY_PER_HEADS_UNOPPOSED,
 )
 from game.skills import Skill, SkillResult, ClashOutcome, resolve_skill, resolve_round_clash, resolve_triggers
 from game.conditions import Trigger, TriggerContext, parse_trigger_text, TriggerParseError
@@ -1886,7 +1886,11 @@ class BattleCog(commands.GroupCog, name="battle"):
                 loser_context = context_b if outcome.winner == "a" else context_a
                 winner_pre_roll_post_hit = pre_roll_post_hit_a if outcome.winner == "a" else pre_roll_post_hit_b
 
-                winner.gain_sanity(SANITY_CLASH_WIN)
+                # Clash win Sanity scales with the winner's coin count --
+                # NOT a flat amount -- computed once here so both the
+                # actual gain and the display text below agree.
+                clash_win_sanity = SANITY_PER_COIN_CLASH_WIN * outcome.winner_final_result.skill.coins
+                winner.gain_sanity(clash_win_sanity)
                 loser.lose_sanity(SANITY_CLASH_LOSS)
 
                 # [Clash Win] and [Attack End] only fire for the winner --
@@ -1981,7 +1985,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     f"({loser.name}: {loser.hp}/{loser.max_hp} HP)"
                 )
                 field_value += (
-                    f"\n{winner.name} Sanity +{SANITY_CLASH_WIN} ({winner.sanity}), "
+                    f"\n{winner.name} Sanity +{clash_win_sanity} ({winner.sanity}), "
                     f"{loser.name} Sanity -{SANITY_CLASH_LOSS} ({loser.sanity})"
                 )
                 if status_log:
