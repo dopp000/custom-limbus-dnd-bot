@@ -14,29 +14,15 @@ class Skill:
     coins: int
     damage_type: str = "blunt"  # "slash", "blunt", or "pierce"
 
-    # Per-coin status effects, one entry per coin (aligned by index).
-    # coin_statuses[i] is None if that coin inflicts nothing. Potency/
-    # count are the RAW values before resistance, resistance gets applied
-    # by the caller (apply_incoming_hit in cogs/battle.py) at hit time.
-    # Status names are not restricted to a fixed list, this same shape
-    # covers keyword statuses (Rupture, Bleed, ...) and non-keyword ones
-    # (Fragile, Bind, Power Down, ...) equally.
+    # Per-coin status effects, one entry per coin (aligned by index). See docs/ENGINEERING_NOTES.md#skills-comment-17.
     coin_statuses: list[str | None] = field(default_factory=list)
     coin_status_potencies: list[int] = field(default_factory=list)
     coin_status_counts: list[int] = field(default_factory=list)
 
-    # Skill-level Conditional Triggers, independent of the per-coin
-    # status system above. Evaluated once per resolution via
-    # resolve_triggers below, not per coin, since a trigger's condition
-    # (target's HP, caster's Sanity, etc.) doesn't change coin to coin
-    # within a single resolution.
+    # Skill-level Conditional Triggers, independent of the per-coin status system above. See docs/ENGINEERING_NOTES.md#skills-comment-28.
     triggers: list[Trigger] = field(default_factory=list)
 
-    # Skill-level metadata flags parsed alongside triggers (target_fixed,
-    # unclashable, indiscriminate, clashable_counter). These aren't
-    # Conditional Triggers themselves -- no condition, no effect, no
-    # timing -- just static properties of the skill that other systems
-    # (declare/clash targeting, etc.) check directly off the Skill.
+    # Skill-level metadata flags parsed alongside triggers (target_fixed, unclashable, indiscriminate, clashable_counter). See docs/ENGINEERING_NOTES.md#skills-comment-35.
     tags: set[str] = field(default_factory=set)
 
     def __post_init__(self):
@@ -59,34 +45,14 @@ class CoinResult:
     power_after: int
     damage_dealt: int
 
-    # Per-coin Triggers (on_hit / heads_hit / tails_hit, matched by
-    # coin_index) that fired on this specific coin, already filtered to
-    # ones whose condition evaluated true. The caller (apply_incoming_hit
-    # in cogs/battle.py) is responsible for actually applying their
-    # effects, same as skill-level post_hit triggers from resolve_triggers.
+    # Per-coin Triggers (on_hit / heads_hit / tails_hit, matched by coin_index) that fired on this specific coin, already filtered to ones... See docs/ENGINEERING_NOTES.md#skills-comment-62.
     fired_triggers: list[Trigger] = field(default_factory=list)
 
-    # True if this coin Crit -- the caster held Poise (count > 0) at the
-    # moment this coin resolved, independent of Heads/Tails (see the
-    # Poise-break rule on resolve_skill below). crit_bonus_damage is the
-    # extra damage that Crit deals (equal to the caster's Poise potency
-    # at that moment), computed here but NOT yet added into damage_dealt
-    # above -- same pattern as Rupture's bonus damage, which also isn't
-    # baked into a coin's own damage_dealt, it's added by the caller
-    # (apply_incoming_hit in cogs/battle.py) at hit-application time,
-    # since that's also where the caster's real Poise stack actually
-    # gets consumed (skills.py never mutates a Fighter).
+    # True if this coin Crit -- the caster held Poise (count > 0) at the moment this coin resolved, independent of Heads/Tails (see the... See docs/ENGINEERING_NOTES.md#skills-comment-69.
     is_crit: bool = False
     crit_bonus_damage: int = 0
 
-    # True if the DEFENDER dodged this coin -- see the Evasion-resource
-    # rule on resolve_skill below. damage_dealt above is already 0 for
-    # an evaded coin (Power still climbed normally, only the hit itself
-    # was negated), and this coin never crits and never fires its
-    # on_hit-family triggers, since nothing actually landed. The real
-    # Evasion stack is consumed by the caller (apply_incoming_hit in
-    # cogs/battle.py), same deferred-mutation pattern as is_crit/Poise
-    # above -- skills.py never touches a Fighter directly.
+    # True if the DEFENDER dodged this coin -- see the Evasion-resource rule on resolve_skill below. See docs/ENGINEERING_NOTES.md#skills-comment-82.
     is_evaded: bool = False
 
 
@@ -123,11 +89,7 @@ class SkillResult:
 
 
 def flip_coin(heads_chance: int = 50) -> bool:
-    """Rolls a percentage-based coin flip. heads_chance is 0-100, the
-    percent chance of landing Heads. Defaults to a fair 50/50 so every
-    existing caller that doesn't pass this stays behaves exactly as
-    before.
-    """
+    """Rolls a percentage-based coin flip. See docs/ENGINEERING_NOTES.md#skills-flip-coin for the full rationale."""
     roll = random.randint(1, 100)
     return roll <= heads_chance
 
@@ -138,81 +100,7 @@ def resolve_skill(
     context: TriggerContext | None = None,
     extra_coin_timings: tuple[str, ...] = (),
 ) -> SkillResult:
-    """Resolves a skill's coins one at a time, in sequence.
-
-    Every coin lands a hit at whatever Power has been built up so far.
-    A Heads permanently raises Power (by coin_power) for every hit after it,
-    including its own. A Tails deals a hit too, just without raising Power.
-
-    heads_chance is this skill's OWN caster's Sanity-driven odds (see
-    Fighter.heads_chance in game/battle.py), defaulting to a fair 50/50.
-
-    context is optional (attrition rounds inside resolve_round_clash pass
-    None, since those tosses never actually deal damage and their
-    per-coin triggers would never be applied anyway). When provided,
-    each coin now fires TWO passes of its own per-coin Triggers (matched
-    by coin_index):
-
-      1. [Coin Start], BEFORE this coin is tossed. Its bonus_power/
-         bonus_coin_power effects are applied immediately -- bonus_power
-         adds straight onto the running Power for this coin (and every
-         coin after it, same as a Heads would), bonus_coin_power raises
-         coin_power itself from this coin onward. Any inflict_status/
-         sanity_gain effect on a [Coin Start] trigger is collected into
-         that coin's fired_triggers same as the hit-timings below (a
-         self-buff on use of this specific coin, not gated on it
-         actually landing since it hasn't tossed yet -- but every coin
-         in this engine deals a hit regardless, so this is a moot
-         distinction in practice).
-
-      2. AFTER the toss: [On Hit] (always), [Heads Hit]/[Tails Hit]
-         (gated on that face), [Current Coin Attack End] (always),
-         [Heads Attack End]/[Tails Attack End] (gated on that face),
-         plus whatever's in extra_coin_timings -- currently only
-         [Hit After Clash Win], passed by resolve_round_clash ONLY for
-         the winner's final decisive toss, never for attrition rounds
-         or a solo unopposed attack.
-
-    Matching, condition-true triggers land in that CoinResult.fired_
-    triggers for the caller (apply_incoming_hit in cogs/battle.py) to
-    apply. Evaluating here (not later) matters because a trigger's
-    condition might depend on state a later coin's own effect changes
-    (e.g. a status this same skill just inflicted).
-
-    Poise-break / Crit rule: if context is given and context.caster
-    currently holds Poise (a StatusInstance with count > 0 -- see
-    SELF_BUFF_STATUSES in game/conditions.py), each coin in this
-    resolution checks that stack IN ORDER: as long as count remains,
-    that coin Crits, consuming exactly 1 count and dealing bonus damage
-    equal to Poise's potency (read fresh at the start of this call, not
-    re-read from the Fighter mid-resolution, since skills.py never
-    mutates a Fighter -- the real consumption happens in
-    apply_incoming_hit, which trusts these per-coin is_crit flags to
-    know how many counts to actually decay off the caster afterward).
-    A Crit is independent of that coin's own face -- [On Crit] fires on
-    ANY crit, [On Crit - Heads Hit]/[On Crit - Tails Hit] additionally
-    gate on which face it landed on, mirroring how [Heads Hit]/[Tails
-    Hit] relate to [On Hit].
-
-    Evasion rule: mirrors Poise-break exactly, but read off the
-    DEFENDER (context.target) instead of the attacker, since it's a
-    reaction to being hit, not something the attacker's own skill does.
-    If context.target currently holds Evasion (count > 0), each coin in
-    this resolution checks that stack IN ORDER: as long as count
-    remains, that coin is dodged, consuming exactly 1 count. An evaded
-    coin's damage_dealt is 0 and it never Crits and never fires its own
-    on_hit-family triggers -- nothing actually landed, so none of that
-    makes sense. Power still climbs normally on a Heads regardless
-    (Evasion blocks damage, it doesn't change who wins a Clash). [Coin
-    Start] still fires even on a coin that ends up evaded, since that's
-    a pre-toss self-buff on the ATTACKER's own skill, decided before
-    evasion is even checked. [On Evade] itself is NOT fired from in
-    here -- see SKILL_LEVEL_TIMINGS["on evade"] in game/conditions.py
-    and fire_evade_triggers in cogs/battle.py, since it's swept across
-    the DEFENDER's own known skills, not tied to this skill's coins at
-    all. The real Evasion stack is consumed by the caller
-    (apply_incoming_hit), same deferred-mutation pattern as Poise.
-    """
+    """Resolves a skill's coins one at a time, in sequence. See docs/ENGINEERING_NOTES.md#skills-resolve-skill for the full rationale."""
     power = skill.base_power
     coin_power = skill.coin_power
     results: list[CoinResult] = []
@@ -302,24 +190,7 @@ def resolve_skill(
 def resolve_triggers(
     skill: Skill, context: TriggerContext, timing: str
 ) -> tuple[Skill, list[Trigger]]:
-    """Evaluates every skill-level trigger matching `timing` against the
-    current context. Per-coin timings (on_hit/heads_hit/tails_hit/etc.)
-    are never handled here -- those only ever fire from inside
-    resolve_skill, one coin at a time, since they need to know that
-    coin's own heads/tails result.
-
-    Pre-roll effects (bonus_power, bonus_coin_power) are baked into a
-    modified copy of the skill immediately, since they have to apply
-    before coins are ever tossed -- this is why it returns a (possibly
-    new) Skill rather than mutating in place. Post-hit effects
-    (inflict_status, sanity_gain) are NOT applied here, they're only
-    evaluated and returned as "fired", so the caller can apply them
-    alongside normal hit resolution (see apply_trigger_effects in
-    cogs/battle.py) only if the skill actually lands -- a losing side of
-    a clash never hits, so its post-hit triggers should never fire even
-    though its pre-roll bonuses still legitimately affected the clash
-    math.
-    """
+    """Evaluates every skill-level trigger matching `timing` against the current context. See docs/ENGINEERING_NOTES.md#skills-resolve-triggers for the full rationale."""
     fired = [
         t for t in skill.triggers
         if t.timing == timing and evaluate_condition(t.condition, context)
@@ -340,15 +211,7 @@ def resolve_triggers(
 
 
 def resolve_clash(result_a: SkillResult, result_b: SkillResult) -> SkillResult | None:
-    """Compares two SkillResults by final_power.
-
-    Returns the winning SkillResult (whose total_damage should be applied to
-    the loser), or None on a tie. You decide how ties get handled at the
-    call site, since that is a rules decision, not a math one.
-
-    Superseded by resolve_round_clash below for actual gameplay, kept
-    here since it's simple and still useful for quick comparisons.
-    """
+    """Compares two SkillResults by final_power. See docs/ENGINEERING_NOTES.md#skills-resolve-clash for the full rationale."""
     if result_a.final_power > result_b.final_power:
         return result_a
     elif result_b.final_power > result_a.final_power:
@@ -435,10 +298,7 @@ def resolve_pairwise_clash(skill_a: Skill, skill_b: Skill, max_rerolls: int = 50
 
 @dataclass
 class ClashRound:
-    """One round of clash attrition: both sides tossed all their currently
-    remaining coins fresh, and whichever side's final Power was lower
-    loses exactly one coin (permanently) heading into the next round.
-    """
+    """One round of clash attrition: both sides tossed all their currently remaining coins fresh, and whichever side's final Power was lower... See docs/ENGINEERING_NOTES.md#skills-clashround for the full rationale."""
     result_a: SkillResult
     result_b: SkillResult
     coins_a_before: int
@@ -448,23 +308,12 @@ class ClashRound:
 
 @dataclass
 class ClashOutcome:
-    """The full outcome of a round-based attrition clash: every attrition
-    round that happened, plus the winner's final one-sided damage toss
-    (a completely fresh roll using whatever coins they had left).
-    """
+    """The full outcome of a round-based attrition clash: every attrition round that happened, plus the winner's final one-sided damage toss (a... See docs/ENGINEERING_NOTES.md#skills-clashoutcome for the full rationale."""
     winner: str  # "a" or "b"
     rounds: list[ClashRound]
     winner_final_result: SkillResult
 
-    # [Before Attack] triggers that fired for the winner specifically,
-    # right before their final decisive toss (see resolve_round_clash
-    # below for why this is separate from the general pre-roll chain
-    # that runs before attrition even starts). Only inflict_status/
-    # sanity_gain effects show up here -- bonus_power/bonus_coin_power
-    # are already baked into winner_final_result by the time this is
-    # populated, same pattern as every other post_hit list in this
-    # engine. The caller (cogs/battle.py combat()) applies these
-    # alongside clash_win/attack_end.
+    # [Before Attack] triggers that fired for the winner specifically, right before their final decisive toss (see resolve_round_clash below... See docs/ENGINEERING_NOTES.md#skills-comment-350.
     winner_before_attack_post_hit: list[Trigger] = field(default_factory=list)
 
     def total_damage(self) -> int:
@@ -480,56 +329,7 @@ def resolve_round_clash(
     context_b: TriggerContext | None = None,
     max_rounds: int = 100,
 ) -> ClashOutcome:
-    """Resolves a clash via round-by-round coin attrition.
-
-    Each round, both sides toss ALL of their currently-remaining coins
-    fresh (not carrying over previous rolls), building Power the normal
-    sequential way. Whichever side's final Power is lower this round
-    permanently loses one coin. A tie means neither side loses a coin,
-    but the round still counts, both sides simply re-toss again next
-    round with unchanged coin counts.
-
-    This repeats until one side's coin count hits zero, at which point
-    the OTHER side wins the clash outright. The winner then makes one
-    final, completely fresh toss using whatever coins they have left,
-    exactly like an unopposed attack, and that toss is what actually
-    deals damage. The attrition rounds themselves never deal damage,
-    they only decide who wins and how many coins the winner has left.
-
-    The winner's per-coin status lists are sliced down to match however
-    many coins survived, keeping the FIRST N entries (front-loading
-    status onto early coin slots is a real strategic choice, since those
-    are the ones most likely to make it through attrition intact).
-
-    heads_chance_a/heads_chance_b are each side's OWN Sanity-driven odds
-    (Fighter.heads_chance()), applied to every toss on that side, both
-    during attrition and on the final damage toss.
-
-    context_a/context_b are each side's TriggerContext, passed through
-    to resolve_skill so per-coin triggers can be evaluated. They're
-    threaded through the attrition-round tosses too (harmless, those
-    tosses never actually apply damage or fired_triggers), and the
-    winner's own context is the one carried into their final decisive
-    toss, since that's the only toss whose fired_triggers actually
-    matter to the caller.
-
-    [Before Attack] is evaluated right here, against the winner only,
-    immediately before their final toss -- NOT bundled into whatever
-    pre-roll chain the caller ran before calling this function at all
-    (see PRE_ROLL_CLASH_TIMINGS in cogs/battle.py, which now only
-    covers combat_start/turn_start/before_use/on_use/clash_start).
-    That's the real distinction between [Clash Start] (both sides, the
-    moment the clash begins, before even the attrition rounds) and
-    [Before Attack] (winner only, the moment right before the hit that
-    actually deals damage) -- they used to collapse into the same
-    pre-toss window, which meant a loser's [Before Attack] trigger
-    could fire even though they never land a hit. Now it can't: the
-    loser's skill/context are never touched here.
-
-    max_rounds is a safety valve against a true infinite loop (a tie
-    every single round forever); hitting it is astronomically unlikely
-    with real coin randomness.
-    """
+    """Resolves a clash via round-by-round coin attrition. See docs/ENGINEERING_NOTES.md#skills-resolve-round-clash for the full rationale."""
     coins_a = skill_a.coins
     coins_b = skill_b.coins
     rounds: list[ClashRound] = []
@@ -570,15 +370,7 @@ def resolve_round_clash(
     winner_heads_chance = heads_chance_a if winner == "a" else heads_chance_b
     winner_context = context_a if winner == "a" else context_b
 
-    # [Before Attack] fires HERE, for the winner only, right before
-    # their one real damage-dealing toss -- see the docstring above for
-    # why this is deliberately separate from whatever pre-roll chain
-    # the caller already ran on skill_a/skill_b before this function
-    # was even called. bonus_power/bonus_coin_power get baked into
-    # winner_skill immediately via resolve_triggers (affecting only
-    # this final toss, never the attrition rounds already resolved
-    # above), inflict_status/sanity_gain triggers are collected for the
-    # caller to apply.
+    # [Before Attack] fires HERE, for the winner only, right before their one real damage-dealing toss -- see the docstring above for why this... See docs/ENGINEERING_NOTES.md#skills-comment-415.
     before_attack_post_hit: list[Trigger] = []
     if winner_context is not None:
         winner_skill, before_attack_post_hit = resolve_triggers(winner_skill, winner_context, "before_attack")
@@ -590,12 +382,7 @@ def resolve_round_clash(
         coin_status_potencies=winner_skill.coin_status_potencies[:winner_remaining],
         coin_status_counts=winner_skill.coin_status_counts[:winner_remaining],
     )
-    # hit_after_clash_win only ever applies to THIS toss -- the winner's
-    # one real damage-dealing toss -- never to the attrition rounds
-    # above (those pass no extra_coin_timings, matching their plain
-    # resolve_skill calls) and never to a solo unopposed attack (that
-    # path in cogs/battle.py calls resolve_skill directly with no
-    # extra_coin_timings either).
+    # hit_after_clash_win only ever applies to THIS toss -- the winner's one real damage-dealing toss -- never to the attrition rounds above... See docs/ENGINEERING_NOTES.md#skills-comment-435.
     final_result = resolve_skill(
         final_skill, winner_heads_chance, winner_context, extra_coin_timings=("hit_after_clash_win",)
     )

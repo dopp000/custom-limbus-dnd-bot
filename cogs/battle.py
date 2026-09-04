@@ -20,40 +20,19 @@ from game.emojis import status_emoji, coin_emoji, coin_roll_emoji, damage_type_e
 LOG_CHANNEL_ID = 1538071557560213595  # #bot-combat-logs
 ADMIN_ROLE_ID = 1468446442430533737  # can manage any fighter, not just their own
 
-# Clashable Guard tuning knobs -- winning replaces normal clash damage
-# with raising the loser's Stagger thresholds by this many percentage
-# points per enabled tier (makes them easier to Stagger later, not an
-# instant Stagger); losing still takes the winner's damage, just cut
-# by this percent. Both easy to retune here if they feel off in play.
+# Clashable Guard tuning knobs -- winning replaces normal clash damage with raising the loser's Stagger thresholds by this many percentage... See docs/ENGINEERING_NOTES.md#battle-comment-23.
 GUARD_STAGGER_THRESHOLD_RAISE = 0.10
 GUARD_LOSE_DAMAGE_REDUCTION_PCT = 25
 
-# Offset: when a Clash forms between two skills that are BOTH tagged as
-# one of these defense-type tags, the Clash cancels outright -- no
-# resolve_round_clash, no damage, no Sanity change, no Triggers on
-# either side -- instead of computing a winner. Deliberately narrow
-# (exactly these four tags, not anything vaguely "defensive"), per
-# design decision: two units both trying to block/redirect the same
-# exchange simply fail to connect with each other, they don't fight.
+# Offset: when a Clash forms between two skills that are BOTH tagged as one of these defense-type tags, the Clash cancels outright -- no... See docs/ENGINEERING_NOTES.md#battle-comment-31.
 DEFENSE_TAGS = {"guard", "clashable_guard", "counter", "clashable_counter"}
 
-# Magnitude (potency * count) thresholds for the status-based half of a
-# fighter's Hint tier, checked highest first. Rupture then gets a flat
-# +1 on top of whatever tier its own magnitude lands on, since its
-# automatic on-hit trigger makes it a real threat even at low numbers,
-# not because it's inherently worse than the others at equal magnitude.
+# Magnitude (potency * count) thresholds for the status-based half of a fighter's Hint tier, checked highest first. See docs/ENGINEERING_NOTES.md#battle-comment-40.
 STATUS_HINT_THRESHOLDS = [(15, 3), (6, 2), (1, 1)]
 
 
 def _can_manage_fighter(interaction: discord.Interaction, fighter: Fighter) -> bool:
-    """True if whoever's invoking this is either the fighter's own linked
-    owner, or holds the server's admin role (ADMIN_ROLE_ID). Used for
-    destructive fighter-management actions like /battle removefighter,
-    where "your own fighter, or an admin" is the right bar -- same
-    pattern /character edit/delete already use, just role-based instead
-    of Discord's built-in manage_guild permission, since that's what was
-    asked for here specifically.
-    """
+    """True if whoever's invoking this is either the fighter's own linked owner, or holds the server's admin role (ADMIN_ROLE_ID). See docs/ENGINEERING_NOTES.md#battle-can-manage-fighter for the full rationale."""
     if fighter.owner_id is not None and interaction.user.id == fighter.owner_id:
         return True
     if isinstance(interaction.user, discord.Member):
@@ -130,13 +109,7 @@ def _skill_preview_text(skill: Skill) -> str:
 def _parse_status_tokens(
     status_input: str, coins: int
 ) -> tuple[list[str | None], list[int], list[int], str | None]:
-    """Parses the comma-separated per-coin status string ('none' or
-    'Name:Potency:Count' per coin) into three aligned lists. Returns
-    (coin_statuses, potencies, counts, error) -- error is None on
-    success, or a user-facing message on failure (ignore the lists in
-    that case). Pulled out of addskill's old body so the new popup's
-    on_submit can share the exact same parsing/error text.
-    """
+    """Parses the comma-separated per-coin status string ('none' or 'Name:Potency:Count' per coin) into three aligned lists. See docs/ENGINEERING_NOTES.md#battle-parse-status-tokens for the full rationale."""
     tokens = [t.strip() for t in status_input.split(",")]
     if len(tokens) == 1 and tokens[0].lower() == "none":
         tokens = ["none"] * coins
@@ -178,18 +151,7 @@ def _parse_status_tokens(
 
 
 class AddSkillModal(discord.ui.Modal, title="New Skill"):
-    """The full skill-creation popup: everything /battle addskill used to
-    collect as 6 required slash-command options (base_power, coin_power,
-    coins, damage_type, status_input) PLUS the separate trigger modal is
-    now just this one popup. addskill itself only takes `fighter` --
-    who's learning it -- and opens this immediately.
-
-    Discord caps a modal at 5 components. To fit within that, Base
-    Power / Coin Power / Coins / Damage Type are packed into one
-    comma-separated line ("5, 5, 3, Blunt") and parsed by hand in
-    on_submit below, same pattern status_input already used for
-    per-coin data -- there wasn't room to give each its own box.
-    """
+    """The full skill-creation popup: everything /battle addskill used to collect as 6 required slash-command options (base_power, coin_power,... See docs/ENGINEERING_NOTES.md#battle-addskillmodal for the full rationale."""
 
     skill_name = discord.ui.TextInput(
         label="Skill Name",
@@ -293,13 +255,7 @@ class AddSkillModal(discord.ui.Modal, title="New Skill"):
         await interaction.response.send_message(preview_text, view=view, ephemeral=True)
 
 
-# Discord silently rejects an ENTIRE modal with a 400 (which the caller
-# only ever sees as a generic "The application did not respond") if any
-# single TextInput's label is over 45 chars or placeholder is over 100
-# -- this bit us for real once (AddSkillModal's status_input label was
-# 46 chars, triggers_input's placeholder was 119). This check runs once
-# at import time and fails loudly and immediately if it ever regresses,
-# instead of silently again at some future /battle addskill call.
+# Discord silently rejects an ENTIRE modal with a 400 (which the caller only ever sees as a generic "The application did not respond") if... See docs/ENGINEERING_NOTES.md#battle-comment-272.
 def _check_modal_field_limits(modal_cls: type[discord.ui.Modal]) -> None:
     for field_name in dir(modal_cls):
         field = getattr(modal_cls, field_name, None)
@@ -541,11 +497,7 @@ def format_clash_rounds(outcome: ClashOutcome, name_a: str, name_b: str) -> str:
 
 
 def _status_hint_tier(fighter: Fighter) -> int:
-    """The worse of a fighter's currently active statuses, mapped to a
-    tier by magnitude (potency * count). Rupture gets a flat +1 on top
-    of its magnitude tier, capped at 3, since its automatic on-hit
-    trigger makes any active Rupture a live threat regardless of size.
-    """
+    """The worse of a fighter's currently active statuses, mapped to a tier by magnitude (potency * count). See docs/ENGINEERING_NOTES.md#battle-status-hint-tier for the full rationale."""
     best = 0
     for status in fighter.statuses.values():
         if status.count <= 0:
@@ -563,12 +515,7 @@ def _status_hint_tier(fighter: Fighter) -> int:
 
 
 def _skill_hint_tier(fighter: Fighter, battle: Battle) -> int:
-    """The highest hint_tier among the fighter's known skills whose
-    trigger condition currently reads true against at least one living
-    enemy. Speculative, this doesn't require the skill to actually be
-    declared, it's meant to warn "this fighter COULD hit hard right now
-    if they use this."
-    """
+    """The highest hint_tier among the fighter's known skills whose trigger condition currently reads true against at least one living enemy. See docs/ENGINEERING_NOTES.md#battle-skill-hint-tier for the full rationale."""
     enemies = [f for f in battle.fighters if f.side != fighter.side and f.is_alive()]
     if not enemies:
         return 0
@@ -585,10 +532,7 @@ def _skill_hint_tier(fighter: Fighter, battle: Battle) -> int:
 
 
 def compute_hint_tier(fighter: Fighter, battle: Battle) -> int | None:
-    """The tier to show on this fighter's Hint line: the higher of their
-    live-triggerable skill danger and their active status danger.
-    Returns None if there's nothing worth flagging.
-    """
+    """The tier to show on this fighter's Hint line: the higher of their live-triggerable skill danger and their active status danger. See docs/ENGINEERING_NOTES.md#battle-compute-hint-tier for the full rationale."""
     tier = max(_skill_hint_tier(fighter, battle), _status_hint_tier(fighter))
     return tier if tier > 0 else None
 
@@ -659,54 +603,7 @@ def apply_incoming_hit(
     attacker_skill: Skill, result: SkillResult, target: Fighter, caster: Fighter,
     skip_evasion: bool = False,
 ) -> tuple[int, list[str], list[Trigger], int]:
-    """Applies each landed coin's damage/status, and collects whichever
-    per-coin Triggers (on_hit/heads_hit/tails_hit) fired on that coin
-    (see CoinResult.fired_triggers), so the caller can hand them to
-    apply_trigger_effects alongside the skill-level ones. `result` here
-    is always the coins that actually landed -- attrition rounds during
-    a clash never reach this function, only the final toss does -- so
-    every coin iterated below is a real hit.
-
-    `caster` is needed so a Crit coin (see CoinResult.is_crit) can
-    consume 1 count off the caster's real Poise stack here -- resolve_skill
-    only computed is_crit against a local copy, it never touches the
-    Fighter object (see its docstring in game/skills.py). Crit bonus
-    damage is folded into the SAME resistance check as the coin's
-    normal damage (still a hit of that skill's damage_type, just a
-    harder one), unlike Rupture's bonus below, which is the TARGET's
-    own reaction and deliberately bypasses resistance entirely.
-
-    Returns evade_count too: how many of this result's coins had
-    is_evaded set (computed in resolve_skill, see its Evasion docstring).
-    An evaded coin is skipped entirely -- no resistance check, no
-    Rupture, no coin status, doesn't add to total_damage -- and just
-    logs the dodge, decaying 1 count off the target's real Evasion
-    stack per dodge.
-
-    skip_evasion=True bypasses the target's Evasion check entirely
-    (every coin lands as if they had none) -- used specifically for a
-    Counter skill's retaliation strike against the original attacker,
-    since Counter is explicitly meant to bypass whatever defensive
-    skills its target has active, not just deal normal damage to them.
-
-    Note: the OLD Counter status/resource mechanic (flat retaliation
-    damage whenever the target held a "counter" status) has been
-    removed entirely -- Counter is now a Skill-level mechanic (see the
-    [Counter]/[Clashable Counter] flags and find_eligible_counter /
-    find_eligible_clashable_counter / apply_counter_redirects below),
-    not something baked into every single hit here.
-
-    Stagger multiplier: if `target` is ALREADY Stagger'd (from an
-    earlier hit, current_stagger_tier > 0) when this hit lands, the
-    summed total_damage gets multiplied by STAGGER_MULTIPLIERS for
-    that tier, applied once to the total rather than per-coin (avoids
-    compounding rounding error across coins). Deliberately checked
-    BEFORE this hit's own Stagger state update -- the hit that FIRST
-    triggers Stagger does NOT get the bonus itself, only hits landing
-    WHILE already Stagger'd do. The caller is responsible for calling
-    target.check_stagger(...) AFTER this function returns and damage
-    has actually been applied via take_damage, so that ordering holds.
-    """
+    """Applies each landed coin's damage/status, and collects whichever per-coin Triggers (on_hit/heads_hit/tails_hit) fired on that coin (see... See docs/ENGINEERING_NOTES.md#battle-apply-incoming-hit for the full rationale."""
     log: list[str] = []
     total_damage = 0
     per_coin_triggers: list[Trigger] = []
@@ -794,21 +691,7 @@ def apply_incoming_hit(
 
 
 def fire_evade_triggers(defender: Fighter, attacker: Fighter, battle: Battle, evade_count: int) -> list[str]:
-    """Fires [On Evade] once per coin the defender actually evaded this
-    hit (evade_count, from apply_incoming_hit above), swept across ALL
-    of the defender's own known skills -- same passive-sweep pattern as
-    fire_passive_triggers uses for [Combat Start]/[Turn Start], since
-    the defender isn't the one whose skill is being resolved right now,
-    they're reacting to someone else's attack, so there's no single
-    "current skill" of theirs to check triggers against.
-
-    caster on the context is the defender (the one who reacted), target
-    is the attacker (so a condition like "if attacker has Rupture" or
-    "if attacker has Fragile" reads naturally off the existing
-    target_status condition type). Called once per evaded coin rather
-    than once per hit, so a trigger like "[On Evade] Gain 2 Sanity"
-    correctly stacks if a multi-coin skill gets partially evaded.
-    """
+    """Fires [On Evade] once per coin the defender actually evaded this hit (evade_count, from apply_incoming_hit above), swept across ALL of... See docs/ENGINEERING_NOTES.md#battle-fire-evade-triggers for the full rationale."""
     if evade_count <= 0:
         return []
     log: list[str] = []
@@ -821,22 +704,7 @@ def fire_evade_triggers(defender: Fighter, attacker: Fighter, battle: Battle, ev
 
 
 def find_eligible_counter(defender: Fighter, attacker_slot_speed: int) -> tuple[int, Skill] | None:
-    """Counter is a reactive Skill-level mechanic, not a status: any
-    skill flagged [Counter] that `defender` has DECLARED this round (in
-    ANY of their slots -- it doesn't matter which one) is a standing
-    threat against every incoming unopposed attack, all round, until it
-    fires once. Eligible if defender hasn't already used their Counter
-    this round (counter_used_this_round, reset every round in
-    Fighter.clear_declaration) AND the declared Counter skill's OWN
-    slot speed beats the attacker's slot speed. Returns the first
-    eligible (slot, skill) found in declared_actions order, or None.
-
-    Doesn't mark it used -- the caller (apply_counter_redirects) only
-    commits that once it actually claims this specific incoming attack,
-    since which attack claims a defender's single Counter charge
-    depends on speed-priority resolution order across the whole round,
-    not just this one comparison.
-    """
+    """Counter is a reactive Skill-level mechanic, not a status: any skill flagged [Counter] that `defender` has DECLARED this round (in ANY of... See docs/ENGINEERING_NOTES.md#battle-find-eligible-counter for the full rationale."""
     if defender.counter_used_this_round:
         return None
     for slot_num, action in defender.declared_actions.items():
@@ -846,10 +714,7 @@ def find_eligible_counter(defender: Fighter, attacker_slot_speed: int) -> tuple[
 
 
 def find_eligible_clashable_counter(defender: Fighter) -> tuple[int, Skill] | None:
-    """Same idea as find_eligible_counter, for [Clashable Counter]. Not
-    speed-gated the way Counter is -- just needs to be declared this
-    round and not yet used (clashable_counter_used_this_round).
-    """
+    """Same idea as find_eligible_counter, for [Clashable Counter]. See docs/ENGINEERING_NOTES.md#battle-find-eligible-clashable-counter for the full rationale."""
     if defender.clashable_counter_used_this_round:
         return None
     for slot_num, action in defender.declared_actions.items():
@@ -859,10 +724,7 @@ def find_eligible_clashable_counter(defender: Fighter) -> tuple[int, Skill] | No
 
 
 def find_eligible_clashable_guard(defender: Fighter) -> tuple[int, Skill] | None:
-    """Same shape as find_eligible_clashable_counter, for
-    [Clashable Guard]. Not speed-gated, just needs to be declared this
-    round and not yet used (clashable_guard_used_this_round).
-    """
+    """Same shape as find_eligible_clashable_counter, for [Clashable Guard]. See docs/ENGINEERING_NOTES.md#battle-find-eligible-clashable-guard for the full rationale."""
     if defender.clashable_guard_used_this_round:
         return None
     for slot_num, action in defender.declared_actions.items():
@@ -872,50 +734,7 @@ def find_eligible_clashable_guard(defender: Fighter) -> tuple[int, Skill] | None
 
 
 def apply_counter_redirects(units: list, battle: Battle) -> list:
-    """Runs once, right after `units` is built and speed-sorted, BEFORE
-    any resolution happens -- transforms the list to reflect Counter and
-    Clashable Counter interceptions, so the main resolution loop further
-    down never needs to know either mechanic exists; it just sees
-    ordinary ('solo', entry) / ('clash', entry_a, entry_b) tuples,
-    exactly the shape it already handles.
-
-    Only ever touches 'solo' units -- a mutual Clash already means both
-    sides are actively fighting back, so neither reactive mechanic
-    applies there. Processes in the SAME speed order the main loop will
-    use, since both mechanics are single-use per round and which
-    incoming attack claims that single use depends on order.
-
-    Pass 1 -- Counter: for every solo unit (attacker -> defender,
-    would otherwise be unopposed), check find_eligible_counter against
-    the defender. If eligible, this unit is entirely replaced: instead
-    of the attacker's skill hitting the defender, the defender's OWN
-    Counter skill now attacks the attacker back (skip_evasion=True on
-    the eventual apply_incoming_hit call, since Counter explicitly
-    bypasses the target's defenses) -- represented here as a normal
-    'solo' unit with caster/target swapped and 'is_counter_retaliation'
-    tagged on the entry so the main loop knows to skip evasion and use
-    different flavor text. The attacker's original action never
-    resolves at all: it was redirected, not merely blocked.
-
-    Pass 2 -- Clashable Counter: for a fighter with one declared, if
-    THEIR OWN action is (still, after pass 1) a solo unit -- i.e. its
-    own declared target never clashed back -- it does NOT just resolve
-    as a normal unopposed hit. Instead, scan every OTHER solo unit for
-    one where someone else is unopposedly attacking any of this
-    fighter's OTHER slots. If found, both units are consumed and
-    replaced with a single real 'clash' unit between the Clashable
-    Counter skill and that intercepted attacker's skill. If nothing to
-    intercept, this fighter's own action simply doesn't resolve at all
-    this round (it "does not activate" -- no consumption, no effect).
-
-    Pass 3 -- Clashable Guard: identical shape to Pass 2 (same
-    unopposed-own-action / scan-for-something-to-intercept / fizzle-if-
-    nothing-found logic, own single-use flag), just tagged
-    'is_clashable_guard_intercept' instead of
-    'is_clashable_counter_intercept' -- the clash branch in combat()
-    checks that tag (well, the skill's own .tags directly) to apply the
-    Guard reward/mitigation instead of normal damage, see there.
-    """
+    """Runs once, right after `units` is built and speed-sorted, BEFORE any resolution happens -- transforms the list to reflect Counter and... See docs/ENGINEERING_NOTES.md#battle-apply-counter-redirects for the full rationale."""
     # Pass 1: Counter.
     pass1: list = []
     for u in units:
@@ -1025,60 +844,15 @@ def apply_counter_redirects(units: list, battle: Battle) -> list:
     return pass3_units
 
 
-# Every pre-roll (pre-toss) skill-level timing, in firing order, for a
-# side that's about to enter a Clash. combat_start/turn_start used to
-# live in this list too, but only ever fired for whatever skill was
-# actually declared that round -- see fire_passive_triggers below,
-# which now covers ALL of a fighter's known skills instead and is
-# called once per fighter per round, before this per-entry chain ever
-# runs. Keeping them here as well would double-fire them for any skill
-# that happens to be both declared AND carries one of those tags.
-#
-# [Before Attack] is deliberately NOT in this list. It used to be
-# bundled in here alongside [On Use], which meant it fired for BOTH
-# sides before attrition even started -- wrong, since the loser never
-# actually attacks. It's now evaluated inside resolve_round_clash
-# itself, for the winner only, immediately before their final decisive
-# toss (see that function's docstring in game/skills.py). [Clash Start]
-# stays here though: it's genuinely a "the clash begins" moment for
-# both sides, before ANY toss (attrition or final), which is exactly
-# what this pre-roll window represents.
+# Every pre-roll (pre-toss) skill-level timing, in firing order, for a side that's about to enter a Clash. See docs/ENGINEERING_NOTES.md#battle-comment-867.
 PRE_ROLL_CLASH_TIMINGS = ("before_use", "on_use", "clash_start")
 
-# Same idea for a side making an unopposed attack. [Before Attack]
-# stays here for the solo path -- there's no attrition to distinguish
-# it from, the single toss IS the attack, so firing it at the same
-# pre-roll moment as [On Use] is already correct.
+# Same idea for a side making an unopposed attack. See docs/ENGINEERING_NOTES.md#battle-comment-887.
 PRE_ROLL_SOLO_TIMINGS = ("before_use", "on_use", "before_attack")
 
 
 def fire_passive_triggers(battle: Battle) -> list[str]:
-    """The persistent Fighter-level buff store this engine was missing:
-    fires [Combat Start] (once per battle) and [Turn Start] (every
-    round) against EVERY skill a living fighter knows, not just
-    whichever one they happened to declare this round. This is what
-    lets a passive like "[Combat Start] Gain 3 Charge" sitting on a
-    skill that never gets used still actually do something.
-
-    There's no per-fighter "turn" separate from the shared round
-    structure in this engine, so [Turn Start] is mapped onto "start of
-    this round's Combat Phase" -- a documented simplification, not a
-    real per-turn system.
-
-    Each fighter's own skills are evaluated with target=None (there's
-    no specific enemy at this moment), so any trigger whose condition
-    actually depends on a target (target_status, speed_faster, ...)
-    correctly never fires here -- see evaluate_condition's handling of
-    a missing target in game/conditions.py. Only effect types that make
-    sense with no live coin toss in progress actually do anything:
-    sanity_gain and gain_status. inflict_status is skipped by
-    apply_trigger_effects (no target to inflict onto); bonus_power/
-    bonus_coin_power are evaluated but have nothing to apply to
-    (there's no skill resolution in progress right now), so writing one
-    against these timings is simply a no-op.
-
-    Returns the combined log lines from every fighter, in fighter order.
-    """
+    """The persistent Fighter-level buff store this engine was missing: fires [Combat Start] (once per battle) and [Turn Start] (every round)... See docs/ENGINEERING_NOTES.md#battle-fire-passive-triggers for the full rationale."""
     timings = ["turn_start"]
     if not battle.started:
         timings.append("combat_start")
@@ -1098,20 +872,7 @@ def fire_passive_triggers(battle: Battle) -> list[str]:
 def _resolve_pre_roll_chain(
     skill: Skill, context: TriggerContext, timings: tuple[str, ...]
 ) -> tuple[Skill, list[Trigger]]:
-    """Chains resolve_triggers across every pre-roll timing in `timings`,
-    in order, folding each stage's bonus_power/bonus_coin_power into the
-    skill before the next stage evaluates against it (so e.g. a [Clash
-    Start] Power buff is visible to [On Use]'s own condition check), and
-    merging every stage's post-hit triggers into one list for the caller
-    to apply once the hit actually lands.
-
-    combat_start/turn_start are NOT in `timings` anymore -- they're
-    fired once per fighter per round, across ALL of that fighter's
-    known skills, by fire_passive_triggers above, before this function
-    ever runs. This function only ever sees the skill actually declared
-    this round, so it no longer needs a `battle` param to check
-    battle.started against.
-    """
+    """Chains resolve_triggers across every pre-roll timing in `timings`, in order, folding each stage's bonus_power/bonus_coin_power into the... See docs/ENGINEERING_NOTES.md#battle-resolve-pre-roll-chain for the full rationale."""
     post_hit: list[Trigger] = []
     for timing in timings:
         skill, fired = resolve_triggers(skill, context, timing)
@@ -1120,27 +881,7 @@ def _resolve_pre_roll_chain(
 
 
 def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Fighter | None) -> list[str]:
-    """Applies the post-hit effects (inflict_status, sanity_gain,
-    gain_status) from whichever triggers fired AND actually landed a
-    hit. Pre-roll effects (bonus_power/bonus_coin_power) are already
-    baked into the skill by resolve_triggers before this ever runs, so
-    there's nothing to do for those here.
-
-    target is optional: passive timings that don't reference an enemy
-    (Combat Start, Turn Start) call this with target=None, since there's
-    nobody to inflict a status onto at that moment -- an inflict_status
-    trigger written against one of those timings is simply skipped
-    rather than crashing (writing one there is a modeling mistake on
-    the skill author's part, not something the engine can resolve).
-
-    gain_status was previously parsed by parse_trigger_text but never
-    actually applied anywhere -- a self-buff trigger (e.g. "[Combat
-    Start] Gain 3 Charge") would silently do nothing. Fixed here: it
-    lands on the CASTER's own statuses dict, same layering as
-    inflict_status but with no resistance applied (Poise/Charge are
-    self-buffs, not something an opponent resists -- see the note on
-    INFLICTABLE_STATUSES in game/statuses.py).
-    """
+    """Applies the post-hit effects (inflict_status, sanity_gain, gain_status) from whichever triggers fired AND actually landed a hit. See docs/ENGINEERING_NOTES.md#battle-apply-trigger-effects for the full rationale."""
     log: list[str] = []
     for t in triggers:
         if t.effect_type == "inflict_status":
@@ -1170,21 +911,7 @@ def apply_trigger_effects(triggers: list[Trigger], caster: Fighter, target: Figh
 
 
 class CombatLogView(discord.ui.View):
-    """One button, "Full Log" -- anyone can click it to see the FULL
-    breakdown of everything that happened this Combat Phase (every
-    attrition round, every coin's face, every Trigger that fired,
-    across every action), as an ephemeral reply to whoever clicked.
-    Replaces the old per-action CombatRevealView (one button per
-    action) with a single consolidated log, per the design decision to
-    have one place to review the whole phase rather than action by
-    action.
-
-    Discord caps a single embed description at 4096 chars and a single
-    message at 10 embeds -- with enough actions in one round the full
-    log can genuinely blow past even that, so entries are packed into
-    as many embeds as fit (up to 10) and anything beyond that is noted
-    rather than silently dropped.
-    """
+    """One button, "Full Log" -- anyone can click it to see the FULL breakdown of everything that happened this Combat Phase (every attrition... See docs/ENGINEERING_NOTES.md#battle-combatlogview for the full rationale."""
 
     def __init__(self, entries: list[tuple[str, str]], timeout: float = 600):
         super().__init__(timeout=timeout)
@@ -1401,10 +1128,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        # Parsed and validated up front, before anything gets mutated --
-        # same "all-or-nothing" principle as the rest of this command:
-        # a bad resistance entry shouldn't leave hp/sanity/etc already
-        # applied while resistances silently fail.
+        # Parsed and validated up front, before anything gets mutated -- same "all-or-nothing" principle as the rest of this command: a bad... See docs/ENGINEERING_NOTES.md#battle-comment-1171.
         resistance_changes: list[tuple[str, int]] = []
         if resistance_input is not None:
             for token in resistance_input.split(","):
@@ -1575,10 +1299,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             await interaction.response.send_message(f"No fighter named {fighter}.", ephemeral=True)
             return
 
-        # The ONLY response for this interaction -- everything about the
-        # skill (name, stats, damage type, statuses, triggers) is now
-        # collected in one popup instead of 6 required slash-command
-        # options plus a second modal. See AddSkillModal above.
+        # The ONLY response for this interaction -- everything about the skill (name, stats, damage type, statuses, triggers) is now collected in... See docs/ENGINEERING_NOTES.md#battle-comment-1345.
         await interaction.response.send_modal(AddSkillModal(target_fighter))
 
     @app_commands.command(
@@ -1753,14 +1474,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 )
                 return
 
-        # Deliberately no preview of the target's own skill here, ever --
-        # you don't get to see what an enemy is bringing before you
-        # commit, regardless of Speed. Whether this ends up a real Clash
-        # is also genuinely unknown at declare time: it only becomes one
-        # if the target's own action in target_slot targets this exact
-        # (caster, slot) back (see combat()'s mutual-match logic). If it
-        # doesn't, this resolves as an unopposed attack instead -- and
-        # you won't know which until /battle combat actually runs.
+        # Deliberately no preview of the target's own skill here, ever -- you don't get to see what an enemy is bringing before you commit,... See docs/ENGINEERING_NOTES.md#battle-comment-1523.
         view = ClashDeclareView(caster, skill, target_fighter, slot, target_slot, self.bot, battle)
         speed_icon = stat_emoji("speed")
         preview = (
@@ -1834,19 +1548,10 @@ class BattleCog(commands.GroupCog, name="battle"):
             )
             return
 
-        # This whole command can take a while now (animating every
-        # attrition round coin-by-coin), so acknowledge the interaction
-        # immediately and do everything else as followups -- the entire
-        # animation lives inside ONE message that gets edited repeatedly
-        # from here until the phase is done.
+        # This whole command can take a while now (animating every attrition round coin-by-coin), so acknowledge the interaction immediately and... See docs/ENGINEERING_NOTES.md#battle-comment-1604.
         await interaction.response.defer()
 
-        # Fires [Combat Start] (first round of the battle only) and
-        # [Turn Start] (every round) against every living fighter's
-        # FULL skill list, not just whatever they declared -- see
-        # fire_passive_triggers's docstring above. Deliberately happens
-        # before any clash/unopposed resolution below, and before
-        # battle.started flips to True at the end of this method.
+        # Fires [Combat Start] (first round of the battle only) and [Turn Start] (every round) against every living fighter's FULL skill list, not... See docs/ENGINEERING_NOTES.md#battle-comment-1611.
         passive_log = fire_passive_triggers(battle)
 
         entries = []
@@ -1867,18 +1572,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             if entry["used"]:
                 continue
             match = None
-            # An Unclashable OR (plain, non-Clashable) Guard skill on
-            # EITHER side forces this to resolve unopposed, even if both
-            # sides' target/target_slot would otherwise mutually match.
-            # Guard doesn't fight in the traditional sense -- it always
-            # resolves as its own standalone "solo" unit that converts
-            # Final Power into Shield HP for the caster instead of
-            # dealing damage (see the solo branch further down).
-            # Clashable Guard is deliberately NOT excluded here -- if
-            # its own declared target genuinely clashes back, that's
-            # allowed to form a normal 'clash' unit (the clash branch
-            # then special-cases the Clashable Guard reward instead of
-            # normal damage, see there for how).
+            # An Unclashable OR (plain, non-Clashable) Guard skill on EITHER side forces this to resolve unopposed, even if both sides'... See docs/ENGINEERING_NOTES.md#battle-comment-1637.
             if not _never_clashes(entry["skill"].tags):
                 for other in entries[i + 1:]:
                     if other["used"]:
@@ -1901,15 +1595,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 units.append(("solo", entry))
 
         def unit_speed(u):
-            # [Guard] must always resolve before anything else, regardless
-            # of its own slot's Speed -- it's raising a defensive Shield,
-            # not racing to land a hit, and a fast attacker beating a slow
-            # Guard to the punch would mean the Shield never exists in time
-            # to matter. A unit is treated as Guard-priority if EITHER side
-            # carries the tag (a clash unit can only reach this point if
-            # one side is [Clashable Guard], since plain [Unclashable]/
-            # [Guard] already blocks normal pairing -- see the matching
-            # loop above).
+            # [Guard] must always resolve before anything else, regardless of its own slot's Speed -- it's raising a defensive Shield, not racing to... See docs/ENGINEERING_NOTES.md#battle-comment-1671.
             if u[0] == "clash":
                 a_speed = u[1]["caster"].slot_speed(u[1]["slot"])
                 b_speed = u[2]["caster"].slot_speed(u[2]["slot"])
@@ -1920,22 +1606,10 @@ class BattleCog(commands.GroupCog, name="battle"):
 
         units.sort(key=unit_speed, reverse=True)
 
-        # Transforms `units` to reflect Counter / Clashable Counter
-        # interceptions -- see apply_counter_redirects's docstring
-        # above. Must run AFTER sorting (it depends on speed-priority
-        # order) and BEFORE any resolution below, since it can replace
-        # or merge units entirely.
+        # Transforms `units` to reflect Counter / Clashable Counter interceptions -- see apply_counter_redirects's docstring above. See docs/ENGINEERING_NOTES.md#battle-comment-1690.
         units = apply_counter_redirects(units, battle)
 
-        # locked_lines holds everything PERMANENTLY decided so far this
-        # Combat Phase: the passive-trigger block (if any), then one
-        # one-line summary per unit as it finishes animating. It's
-        # re-rendered on every single edit below alongside whatever
-        # unit is currently mid-animation, so earlier results are never
-        # lost while later ones are still resolving -- this is what
-        # makes the whole phase feel like one continuous message rather
-        # than N separate ones (the design choice made for this
-        # rewrite: one message for the entire phase, not one per unit).
+        # locked_lines holds everything PERMANENTLY decided so far this Combat Phase: the passive-trigger block (if any), then one one-line... See docs/ENGINEERING_NOTES.md#battle-comment-1697.
         locked_lines: list[str] = []
         if passive_log:
             locked_lines.append("**Passive Triggers**\n" + "\n".join(passive_log))
@@ -1949,15 +1623,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         combat_message = await interaction.followup.send(embed=initial_embed, wait=True)
 
         async def render(live_block: str | None):
-            """Re-renders the ONE shared combat_message: every locked
-            (finished) line, plus whatever the current unit's live
-            animation looks like right now. Called constantly during
-            animation -- this is genuinely a lot of message edits for a
-            busy round (every coin face, every round, every unit), which
-            is an intentional trade-off for the full-fidelity animation
-            the user asked for over a faster but less spectacle-driven
-            reveal.
-            """
+            """Re-renders the ONE shared combat_message: every locked (finished) line, plus whatever the current unit's live animation looks like right... See docs/ENGINEERING_NOTES.md#battle-battlecog-combat-render for the full rationale."""
             parts = []
             base = "\n\n".join(locked_lines)
             if base:
@@ -1970,22 +1636,12 @@ class BattleCog(commands.GroupCog, name="battle"):
             embed = discord.Embed(title=combat_title, description=description, color=0x5865F2)
             await combat_message.edit(embed=embed)
 
-        # Coin-by-coin animation is pure PRESENTATION over results that
-        # are already fully computed the instant resolve_skill/
-        # resolve_round_clash/apply_incoming_hit run below -- same
-        # principle the old "rolling" flavor message used, just carried
-        # all the way through instead of stopping after one flourish.
-        # Nothing here recomputes damage, crits, evasion, resistance,
-        # or triggers; it only controls the PACING of revealing numbers
-        # that already exist.
+        # Coin-by-coin animation is pure PRESENTATION over results that are already fully computed the instant resolve_skill/... See docs/ENGINEERING_NOTES.md#battle-comment-1732.
         COIN_FACE_DELAY = 0.55
         COIN_DETAIL_DELAY = 0.4
 
         async def animate_faces(live_header: str, coin_results: list) -> str:
-            """Phase one: reveals each coin's face one at a time, rolling
-            icon first, mirroring a real Limbus clash flipping its coins
-            in sequence. Returns the finished face row.
-            """
+            """Phase one: reveals each coin's face one at a time, rolling icon first, mirroring a real Limbus clash flipping its coins in sequence. See docs/ENGINEERING_NOTES.md#battle-battlecog-combat-animate-faces for the full rationale."""
             n = len(coin_results)
             revealed: list[str] = []
             for c in coin_results:
@@ -1999,12 +1655,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             return face_line
 
         async def animate_power(live_header: str, face_line: str, coin_results: list) -> str:
-            """Phase two for an ATTRITION ROUND toss: once every coin's
-            face is showing, reveal each coin's running Power one at a
-            time (this is a round toss, nobody actually takes damage
-            yet -- only Power is being compared to decide who loses a
-            coin this round).
-            """
+            """Phase two for an ATTRITION ROUND toss: once every coin's face is showing, reveal each coin's running Power one at a time (this is a... See docs/ENGINEERING_NOTES.md#battle-battlecog-combat-animate-power for the full rationale."""
             lines = []
             for i, c in enumerate(coin_results, start=1):
                 lines.append(f"  Coin {i}: Power {c.power_after}")
@@ -2013,15 +1664,7 @@ class BattleCog(commands.GroupCog, name="battle"):
             return "\n".join(lines)
 
         async def animate_damage(live_header: str, face_line: str, coin_results: list, hit_log: list[str]) -> str:
-            """Phase two for the FINAL DECISIVE toss -- "once all the
-            coins break, it goes through the animation again for the
-            damage output one by one per coin". hit_log is the flat log
-            apply_incoming_hit already produced for this exact hit
-            (every line prefixed "Coin N:", covering resistance,
-            Crit/Rupture/status/Counter notes, and dodges) -- this
-            never recomputes anything, it just reveals those
-            already-applied lines grouped by coin, one coin at a time.
-            """
+            """Phase two for the FINAL DECISIVE toss -- "once all the coins break, it goes through the animation again for the damage output one by one... See docs/ENGINEERING_NOTES.md#battle-battlecog-combat-animate-damage for the full rationale."""
             lines = []
             for i in range(1, len(coin_results) + 1):
                 coin_lines = [l for l in hit_log if l.startswith(f"Coin {i}:")]
@@ -2056,10 +1699,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     caster=fighter_b, target=fighter_a, battle=battle,
                     is_first_hit_of_round=not first_action_done,
                 )
-                # Full pre-roll chain for both sides -- see
-                # PRE_ROLL_CLASH_TIMINGS / _resolve_pre_roll_chain above
-                # for firing order and the documented [Clash Start] /
-                # [Before Attack] scope collapse.
+                # Full pre-roll chain for both sides -- see PRE_ROLL_CLASH_TIMINGS / _resolve_pre_roll_chain above for firing order and the documented... See docs/ENGINEERING_NOTES.md#battle-comment-1802.
                 skill_a, pre_roll_post_hit_a = _resolve_pre_roll_chain(
                     entry_a["skill"], context_a, PRE_ROLL_CLASH_TIMINGS
                 )
@@ -2093,29 +1733,14 @@ class BattleCog(commands.GroupCog, name="battle"):
                 winner.gain_sanity(clash_win_sanity)
                 loser.lose_sanity(SANITY_CLASH_LOSS)
 
-                # [Clash Win] and [Attack End] only fire for the winner --
-                # the loser never actually lands a hit, so neither an
-                # on-hit-family Trigger nor an "attack end" one makes
-                # sense for them (resolve_triggers is only ever called
-                # with the loser's own skill+context at "clash_lose").
-                # [Turn End] is different: it fires for BOTH sides, since
-                # it's about that fighter's own turn ending, not about
-                # whether they landed a hit.
+                # [Clash Win] and [Attack End] only fire for the winner -- the loser never actually lands a hit, so neither an on-hit-family Trigger nor... See docs/ENGINEERING_NOTES.md#battle-comment-1839.
                 _, clash_win_post_hit = resolve_triggers(winner_skill, winner_context, "clash_win")
                 _, attack_end_post_hit = resolve_triggers(winner_skill, winner_context, "attack_end")
                 _, turn_end_post_hit_winner = resolve_triggers(winner_skill, winner_context, "turn_end")
                 _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
                 _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
-                # Clashable Guard replaces normal clash damage with its
-                # own reward/mitigation, on EITHER side -- see
-                # GUARD_STAGGER_THRESHOLD_RAISE / GUARD_LOSE_DAMAGE_REDUCTION_PCT
-                # near the top of this function's module for the tuning
-                # knobs. Winning with Clashable Guard deals NO damage at
-                # all -- the reward is raising the loser's Stagger
-                # thresholds (making them easier to Stagger later), not
-                # a hit. Losing WITH a Clashable Guard skill still takes
-                # the winner's damage, just reduced.
+                # Clashable Guard replaces normal clash damage with its own reward/mitigation, on EITHER side -- see GUARD_STAGGER_THRESHOLD_RAISE /... See docs/ENGINEERING_NOTES.md#battle-comment-1853.
                 winner_is_clashable_guard = "clashable_guard" in winner_skill.tags
                 loser_is_clashable_guard = "clashable_guard" in loser_skill.tags
                 guard_note: str | None = None
@@ -2158,10 +1783,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     winner, loser,
                 )
                 trigger_log += apply_trigger_effects(clash_lose_post_hit + turn_end_post_hit_loser, loser, winner)
-                # [On Evade] is the LOSER's own reaction -- they're the
-                # one who just got hit by the winner's final toss, see
-                # fire_evade_triggers for why this needs its own call
-                # rather than folding into apply_trigger_effects.
+                # [On Evade] is the LOSER's own reaction -- they're the one who just got hit by the winner's final toss, see fire_evade_triggers for why... See docs/ENGINEERING_NOTES.md#battle-comment-1904.
                 trigger_log += fire_evade_triggers(loser, winner, battle, evade_count)
                 if guard_note:
                     trigger_log.append(guard_note)
@@ -2269,14 +1891,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                     is_first_hit_of_round=not first_action_done,
                 )
 
-                # Full pre-roll chain -- see PRE_ROLL_SOLO_TIMINGS /
-                # _resolve_pre_roll_chain above. A Counter retaliation
-                # still goes through this same chain, since it's the
-                # defender's own skill resolving normally -- the only
-                # thing special about it is skip_evasion below. Guard
-                # goes through it too -- it's still a skill being used,
-                # its coins still get tossed normally, only what happens
-                # with the RESULT differs (Shield instead of damage).
+                # Full pre-roll chain -- see PRE_ROLL_SOLO_TIMINGS / _resolve_pre_roll_chain above. See docs/ENGINEERING_NOTES.md#battle-comment-2015.
                 adjusted_skill, pre_roll_post_hit = _resolve_pre_roll_chain(
                     entry["skill"], context, PRE_ROLL_SOLO_TIMINGS
                 )
@@ -2288,14 +1903,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                 fighter.gain_sanity(sanity_gain)
 
                 if is_guard:
-                    # Guard never deals damage -- its Final Power (the
-                    # Power reached after the last coin, same value a
-                    # Clash would compare) becomes Shield HP for the
-                    # CASTER instead. No apply_incoming_hit call at all:
-                    # there's no hit landing on anyone, target is just
-                    # whatever slot the player had to fill in to declare
-                    # it (declare() still requires one), functionally
-                    # vestigial here.
+                    # Guard never deals damage -- its Final Power (the Power reached after the last coin, same value a Clash would compare) becomes Shield HP... See docs/ENGINEERING_NOTES.md#battle-comment-2034.
                     shield_gained = result.final_power
                     fighter.shield += shield_gained
                     total_damage = 0
@@ -2329,10 +1937,7 @@ class BattleCog(commands.GroupCog, name="battle"):
                             + turn_end_post_hit + per_coin_triggers + stagger_post_hit,
                             fighter, target,
                         )
-                        # [On Evade] is the TARGET's own reaction to this
-                        # unopposed attack -- doesn't apply to a Counter
-                        # retaliation, which explicitly bypasses it
-                        # (skip_evasion=True already means evade_count is 0).
+                        # [On Evade] is the TARGET's own reaction to this unopposed attack -- doesn't apply to a Counter retaliation, which explicitly bypasses it... See docs/ENGINEERING_NOTES.md#battle-comment-2075.
                         trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
 
                 # ---- Animate: no attrition rounds for an unopposed attack, straight to the decisive toss ----
@@ -2408,10 +2013,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         if footer_note:
             final_embed.set_footer(text=footer_note)
 
-        # Whatever [Combat Start] triggers were going to fire this battle
-        # already fired above (or didn't, if nobody had one declared) --
-        # this flips permanently so they never fire again in later rounds
-        # of the same battle.
+        # Whatever [Combat Start] triggers were going to fire this battle already fired above (or didn't, if nobody had one declared) -- this... See docs/ENGINEERING_NOTES.md#battle-comment-2154.
         battle.started = True
 
         # Clear any Stagger whose expiry round has now been reached --
@@ -2427,13 +2029,7 @@ class BattleCog(commands.GroupCog, name="battle"):
         log_view = CombatLogView(full_log_entries) if full_log_entries else None
         await combat_message.edit(embed=final_embed, view=log_view)
 
-        # Once the whole phase is done, post the updated battle status
-        # as a FRESH message in the channel (not just a silent edit of
-        # whatever the old tracked message was, which may be scrolled
-        # far above the animation that just happened) -- and start
-        # tracking THIS new message going forward, so future declares/
-        # addfighter/etc. edit the freshest copy instead of an old one
-        # buried above a wall of combat animation.
+        # Once the whole phase is done, post the updated battle status as a FRESH message in the channel (not just a silent edit of whatever the... See docs/ENGINEERING_NOTES.md#battle-comment-2173.
         status_message = await interaction.channel.send(embed=build_battle_embed(battle))
         battle.message_id = status_message.id
 

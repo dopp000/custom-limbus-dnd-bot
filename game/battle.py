@@ -7,24 +7,14 @@ from game.resistances import DEFAULT_RESISTANCES
 SANITY_MIN = -45
 SANITY_MAX = 45
 
-# Clash win is +2 SP PER COIN in the winner's winning skill (variable,
-# not flat -- see SANITY_PER_COIN_CLASH_WIN below, applied against
-# outcome.winner_final_result.skill.coins by the caller in
-# cogs/battle.py). Clash loss and the unopposed-Heads bonus stay flat.
+# Clash win is +2 SP PER COIN in the winner's winning skill (variable, not flat -- see SANITY_PER_COIN_CLASH_WIN below, applied against... See docs/ENGINEERING_NOTES.md#battle-comment-10.
 SANITY_PER_COIN_CLASH_WIN = 2
 SANITY_CLASH_LOSS = 3
 SANITY_PER_HEADS_UNOPPOSED = 2
 SANITY_DRIFT_POSITIVE = 4
 SANITY_DRIFT_NEGATIVE = 2
 
-# Default Stagger thresholds as HP% (Tier 1 = mildest/first crossed as
-# HP drops, Tier 3 = harshest/last crossed), and the incoming-damage
-# multiplier each tier applies WHILE active. Both are per-character
-# customizable (Fighter.stagger_thresholds / stagger_tiers_enabled),
-# these are just the defaults a Fighter starts with. See
-# Fighter.check_stagger below for the actual detection/duration logic,
-# and STAGGER_MULTIPLIERS' use in apply_incoming_hit (cogs/battle.py)
-# for where the multiplier actually gets applied.
+# Default Stagger thresholds as HP% (Tier 1 = mildest/first crossed as HP drops, Tier 3 = harshest/last crossed), and the incoming-damage... See docs/ENGINEERING_NOTES.md#battle-comment-20.
 DEFAULT_STAGGER_THRESHOLDS = [0.55, 0.40, 0.25]
 STAGGER_MULTIPLIERS = [1.5, 2.0, 2.5]
 
@@ -41,40 +31,13 @@ BATTLE_TYPES = {
 
 @dataclass
 class DeclaredAction:
-    """One skill+target pairing occupying one of a fighter's skill slots,
-    explicitly aimed at one specific slot on the target.
-
-    slot is the CASTER's own slot number (1-based) this action lives in.
-    target_slot is which of the TARGET's slots this action is aimed at.
-    A real Clash only happens if the target's own action in target_slot
-    points back at (this caster, slot) -- see combat() in cogs/battle.py.
-
-    target and target_slot are deliberately mutable (not frozen), since a
-    speed-priority clash steal can silently redirect an already-declared
-    action's target onto a different enemy after the fact, without the
-    original caster knowing beforehand. See Battle.find_mutual_clash_partner
-    and StealApprovalView in cogs/battle.py.
-    """
+    """One skill+target pairing occupying one of a fighter's skill slots, explicitly aimed at one specific slot on the target. See docs/ENGINEERING_NOTES.md#battle-declaredaction for the full rationale."""
     skill: Skill
     target: "Fighter"
     slot: int
     target_slot: int
 
-    # Additional target-side slots this same action also "reaches",
-    # beyond the primary target_slot -- only ever populated for a skill
-    # tagged [Attack Weight] (see SKILL_FLAG_TAGS in game/conditions.py).
-    # This is still ONE action with ONE coin toss and ONE damage result
-    # (see apply_incoming_hit / resolve_round_clash, neither of which
-    # loop per reached slot) -- extra_target_slots exists purely so the
-    # Clash-matching loop in combat() (cogs/battle.py) can also pair
-    # this action against a defender declared in any of these slots,
-    # not just target_slot. It does NOT multiply damage: whichever
-    # single reached slot actually forms the real Clash (target_slot
-    # takes priority if eligible, see the matching loop) is the whole
-    # story -- winning that Clash cancels the entire attack, and if
-    # nothing clashes it, it resolves as one ordinary unopposed hit
-    # exactly like a non-Attack-Weight action, since damage already
-    # lands on the target Fighter's whole HP/Shield pool, never per-slot.
+    # Additional target-side slots this same action also "reaches", beyond the primary target_slot -- only ever populated for a skill tagged... See docs/ENGINEERING_NOTES.md#battle-comment-50.
     extra_target_slots: list[int] = field(default_factory=list)
 
 
@@ -91,27 +54,14 @@ class Fighter:
     avatar_url: str | None = None
     resistances: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RESISTANCES))
 
-    # Discord user ID of whoever controls this fighter. Set from
-    # Character.owner_id for saved characters, or from whoever ran
-    # /battle addfighter for a one-off NPC. Used to DM this fighter's
-    # controller for things they need to privately approve, like a
-    # clash-steal request, since ephemeral replies only reach whoever
-    # is actually running the current slash command.
+    # Discord user ID of whoever controls this fighter. See docs/ENGINEERING_NOTES.md#battle-comment-81.
     owner_id: int | None = None
 
-    # The range each of this fighter's skill slots rolls its own Speed
-    # from, once per round (e.g. 4-7). Defaults to a constant range equal
-    # to `speed`, so a fighter with no explicit range set just behaves
-    # like every slot has the same fixed speed, matching the old
-    # single-speed behavior. Real per-character ranges (set via
-    # /character edit) are pulled in by from_character below.
+    # The range each of this fighter's skill slots rolls its own Speed from, once per round (e.g. See docs/ENGINEERING_NOTES.md#battle-comment-89.
     speed_min: int | None = None
     speed_max: int | None = None
 
-    # One rolled speed per skill slot, independent of whatever skill (if
-    # any) ends up assigned to that slot. Rolled fresh at Fighter creation
-    # and at the start of every round. This is what determines Clash/
-    # unopposed resolution order now, not the flat `speed` stat above.
+    # One rolled speed per skill slot, independent of whatever skill (if any) ends up assigned to that slot. See docs/ENGINEERING_NOTES.md#battle-comment-98.
     slot_speeds: list[int] = field(default_factory=list)
 
     skills: dict[str, Skill] = field(default_factory=dict)
@@ -123,36 +73,18 @@ class Fighter:
 
     statuses: dict[str, StatusInstance] = field(default_factory=dict)
 
-    # Round-scoped single-use flags for the two Counter-family Skill
-    # flags ([Counter] and [Clashable Counter], see SKILL_FLAG_TAGS in
-    # game/conditions.py). Both reset every round in clear_declaration
-    # below. See find_eligible_counter / find_eligible_clashable_counter
-    # / apply_counter_redirects in cogs/battle.py for how these get set.
+    # Round-scoped single-use flags for the two Counter-family Skill flags ([Counter] and [Clashable Counter], see SKILL_FLAG_TAGS in... See docs/ENGINEERING_NOTES.md#battle-comment-113.
     counter_used_this_round: bool = False
     clashable_counter_used_this_round: bool = False
     clashable_guard_used_this_round: bool = False
 
-    # Stagger. stagger_thresholds is 3 HP% values (Tier 1/2/3, in that
-    # order -- descending, Tier 1 is the highest/mildest/first crossed).
-    # stagger_tiers_enabled marks which of the 3 actually exist for this
-    # character -- Tier 1 (index 0) should never be set False (nothing
-    # enforces that here, it's a character-creation rule, see the
-    # Stagger tier trade-off in the README). current_stagger_tier is 0
-    # when not Stagger'd, else 1/2/3. stagger_clears_end_of_round is the
-    # LAST battle.round_number this Stagger is still active for --
-    # cleared once that round's combat() finishes, see the clearing
-    # logic in combat() itself.
+    # Stagger. See docs/ENGINEERING_NOTES.md#battle-comment-122.
     stagger_thresholds: list[float] = field(default_factory=lambda: list(DEFAULT_STAGGER_THRESHOLDS))
     stagger_tiers_enabled: list[bool] = field(default_factory=lambda: [True, True, True])
     current_stagger_tier: int = 0
     stagger_clears_end_of_round: int | None = None
 
-    # Shield HP from a [Guard] skill: an overhead pool consumed BEFORE
-    # regular HP, not a resistance or a damage-avoidance mechanic --
-    # incoming damage is computed exactly the same way whether or not
-    # Shield exists, take_damage below just drains this first. Clears
-    # every round in clear_declaration (Guard doesn't carry over -- a
-    # fresh Guard each round is the only way to keep it topped up).
+    # Shield HP from a [Guard] skill: an overhead pool consumed BEFORE regular HP, not a resistance or a damage-avoidance mechanic -- incoming... See docs/ENGINEERING_NOTES.md#battle-comment-137.
     shield: int = 0
 
     def __post_init__(self):
@@ -176,12 +108,7 @@ class Fighter:
             resistances=dict(character.resistances),
             owner_id=character.owner_id,
         )
-        # If the saved character has its own speed range (set via
-        # /character edit), it takes over from the flat speed default
-        # that __post_init__ already applied above, and slots are
-        # rerolled against the real range. /battle addfighter's own
-        # speed_min/speed_max params still override this afterward if
-        # the host passes them, since that runs after this returns.
+        # If the saved character has its own speed range (set via /character edit), it takes over from the flat speed default that __post_init__... See docs/ENGINEERING_NOTES.md#battle-comment-166.
         if character.speed_min is not None:
             fighter.speed_min = character.speed_min
             fighter.speed_max = (
@@ -191,10 +118,7 @@ class Fighter:
         return fighter
 
     def roll_slot_speeds(self):
-        """Rerolls every skill slot's own Speed within [speed_min, speed_max].
-        Called on creation and again at the start of every round -- slot
-        speed is independent of whatever skill later gets assigned to it.
-        """
+        """Rerolls every skill slot's own Speed within [speed_min, speed_max]. See docs/ENGINEERING_NOTES.md#battle-fighter-roll-slot-speeds for the full rationale."""
         low, high = self.speed_min, self.speed_max
         if high < low:
             low, high = high, low
@@ -204,10 +128,7 @@ class Fighter:
         ]
 
     def slot_speed(self, slot: int) -> int:
-        """1-based slot lookup. Returns 0 for an out-of-range slot rather
-        than raising, since this gets called from places that only
-        loosely validate slot numbers first.
-        """
+        """1-based slot lookup. See docs/ENGINEERING_NOTES.md#battle-fighter-slot-speed for the full rationale."""
         if 1 <= slot <= len(self.slot_speeds):
             return self.slot_speeds[slot - 1]
         return 0
@@ -225,12 +146,7 @@ class Fighter:
         return self.hp > 0
 
     def take_damage(self, amount: int) -> tuple[int, int]:
-        """Consumes Shield first (1:1, no reduction of its own -- Shield
-        isn't a resistance, it's a literal overhead HP pool), then
-        spills whatever's left into regular HP. Returns
-        (shield_absorbed, hp_damage) so the caller can log the split if
-        it wants to (see combat() in cogs/battle.py).
-        """
+        """Consumes Shield first (1:1, no reduction of its own -- Shield isn't a resistance, it's a literal overhead HP pool), then spills... See docs/ENGINEERING_NOTES.md#battle-fighter-take-damage for the full rationale."""
         shield_absorbed = min(self.shield, amount)
         self.shield -= shield_absorbed
         remaining = amount - shield_absorbed
@@ -238,24 +154,7 @@ class Fighter:
         return shield_absorbed, remaining
 
     def check_stagger(self, current_round: int) -> int:
-        """Checks current HP% against every ENABLED Stagger threshold and
-        updates current_stagger_tier / stagger_clears_end_of_round if the
-        deepest currently-qualifying tier is at least as deep as this
-        fighter's existing tier (refreshing duration either way, even if
-        the tier itself doesn't change -- taking more damage while
-        already Stagger'd at that depth still resets the clock). Call
-        this AFTER applying a hit's damage via take_damage, not before.
-
-        Each tier's threshold is checked independently (hp_pct <=
-        threshold), not as a sequential crossing -- so disabling Tier 2
-        doesn't block Tier 3 from triggering on its own if HP drops low
-        enough, it just means the milder Tier 2 penalty is skipped for
-        HP in that in-between range (Tier 1 still applies there instead,
-        since its own threshold is still satisfied).
-
-        Returns the tier now active (0 if none, unchanged from before if
-        nothing new qualifies).
-        """
+        """Checks current HP% against every ENABLED Stagger threshold and updates current_stagger_tier / stagger_clears_end_of_round if the deepest... See docs/ENGINEERING_NOTES.md#battle-fighter-check-stagger for the full rationale."""
         if self.max_hp <= 0:
             return self.current_stagger_tier
 
@@ -279,11 +178,7 @@ class Fighter:
         return self.current_stagger_tier
 
     def clear_expired_stagger(self, ending_round: int):
-        """Called once, at the end of a round's combat() resolution
-        (right before battle.round_number increments), for every living
-        fighter. Clears this fighter's Stagger if its stored expiry
-        round has been reached.
-        """
+        """Called once, at the end of a round's combat() resolution (right before battle.round_number increments), for every living fighter. See docs/ENGINEERING_NOTES.md#battle-fighter-clear-expired-stagger for the full rationale."""
         if (
             self.current_stagger_tier > 0
             and self.stagger_clears_end_of_round is not None
@@ -317,20 +212,7 @@ class Fighter:
         self, slot: int, skill: Skill, target: "Fighter", target_slot: int,
         extra_target_slots: list[int] | None = None,
     ) -> bool:
-        """Fills (or overwrites/moves) one specific skill slot.
-
-        Returns False only if the slot number itself is out of range.
-        Unlike the old declare(), this deliberately allows re-declaring
-        an already-filled slot -- that's how "move a skill to a
-        different slot" and "swap which skill is in this slot" both
-        work: undeclare the old one (or just overwrite it here) and
-        declare_in_slot the new one.
-
-        extra_target_slots is only ever non-empty for an [Attack Weight]
-        skill (validated by the caller, /battle declare in
-        cogs/battle.py, before this is ever called) -- see
-        DeclaredAction.extra_target_slots for what it actually does.
-        """
+        """Fills (or overwrites/moves) one specific skill slot. See docs/ENGINEERING_NOTES.md#battle-fighter-declare-in-slot for the full rationale."""
         if not (1 <= slot <= self.skill_slots):
             return False
         self.declared_actions[slot] = DeclaredAction(
@@ -398,22 +280,7 @@ class Battle:
         )
 
     def find_mutual_clash_partner(self, target: Fighter, target_slot: int) -> tuple[Fighter, int] | None:
-        """Checks whether target's target_slot is currently locked in a
-        real mutual clash with some other fighter: that fighter's own
-        declared action targets exactly target's target_slot, AND
-        target's action in target_slot targets exactly that fighter's
-        slot back.
-
-        Returns (fighter, slot) of that clash partner, or None if
-        target_slot isn't currently in a genuine mutual clash (nothing
-        declared there yet, or only a one-sided declare so far).
-
-        Used to detect a clash-steal situation: if a third fighter also
-        wants target's target_slot, and this returns a partner on that
-        third fighter's own side, the partner is the ally who'd have to
-        approve giving up the clash. See StealApprovalView in
-        cogs/battle.py.
-        """
+        """Checks whether target's target_slot is currently locked in a real mutual clash with some other fighter: that fighter's own declared... See docs/ENGINEERING_NOTES.md#battle-battle-find-mutual-clash-partner for the full rationale."""
         target_action = target.declared_actions.get(target_slot)
         if target_action is None:
             return None
