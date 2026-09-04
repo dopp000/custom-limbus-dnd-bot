@@ -20,6 +20,14 @@ from game.emojis import status_emoji, coin_emoji, coin_roll_emoji, damage_type_e
 LOG_CHANNEL_ID = 1538071557560213595  # #bot-combat-logs
 ADMIN_ROLE_ID = 1468446442430533737  # can manage any fighter, not just their own
 
+# Clashable Guard tuning knobs -- winning replaces normal clash damage
+# with raising the loser's Stagger thresholds by this many percentage
+# points per enabled tier (makes them easier to Stagger later, not an
+# instant Stagger); losing still takes the winner's damage, just cut
+# by this percent. Both easy to retune here if they feel off in play.
+GUARD_STAGGER_THRESHOLD_RAISE = 0.10
+GUARD_LOSE_DAMAGE_REDUCTION_PCT = 25
+
 # Magnitude (potency * count) thresholds for the status-based half of a
 # fighter's Hint tier, checked highest first. Rupture then gets a flat
 # +1 on top of whatever tier its own magnitude lands on, since its
@@ -844,6 +852,19 @@ def find_eligible_clashable_counter(defender: Fighter) -> tuple[int, Skill] | No
     return None
 
 
+def find_eligible_clashable_guard(defender: Fighter) -> tuple[int, Skill] | None:
+    """Same shape as find_eligible_clashable_counter, for
+    [Clashable Guard]. Not speed-gated, just needs to be declared this
+    round and not yet used (clashable_guard_used_this_round).
+    """
+    if defender.clashable_guard_used_this_round:
+        return None
+    for slot_num, action in defender.declared_actions.items():
+        if "clashable_guard" in action.skill.tags:
+            return slot_num, action.skill
+    return None
+
+
 def apply_counter_redirects(units: list, battle: Battle) -> list:
     """Runs once, right after `units` is built and speed-sorted, BEFORE
     any resolution happens -- transforms the list to reflect Counter and
@@ -880,6 +901,14 @@ def apply_counter_redirects(units: list, battle: Battle) -> list:
     Counter skill and that intercepted attacker's skill. If nothing to
     intercept, this fighter's own action simply doesn't resolve at all
     this round (it "does not activate" -- no consumption, no effect).
+
+    Pass 3 -- Clashable Guard: identical shape to Pass 2 (same
+    unopposed-own-action / scan-for-something-to-intercept / fizzle-if-
+    nothing-found logic, own single-use flag), just tagged
+    'is_clashable_guard_intercept' instead of
+    'is_clashable_counter_intercept' -- the clash branch in combat()
+    checks that tag (well, the skill's own .tags directly) to apply the
+    Guard reward/mitigation instead of normal damage, see there.
     """
     # Pass 1: Counter.
     pass1: list = []
@@ -945,7 +974,49 @@ def apply_counter_redirects(units: list, battle: Battle) -> list:
         entry["is_clashable_counter_intercept"] = True
         final_units.append(("clash", entry, intercepted_entry))
 
-    return final_units
+    # Pass 3: Clashable Guard. Runs against final_units (post Pass 2),
+    # same scan-for-an-interceptable-solo-unit logic, own flag/tag.
+    pass3_units: list = []
+    consumed3: set[int] = set()
+    for idx, u in enumerate(final_units):
+        if idx in consumed3:
+            continue
+        if u[0] != "solo":
+            pass3_units.append(u)
+            continue
+        entry = u[1]
+        caster = entry["caster"]
+        if "clashable_guard" not in entry["skill"].tags:
+            pass3_units.append(u)
+            continue
+        found = find_eligible_clashable_guard(caster)
+        if found is None:
+            pass3_units.append(u)
+            continue
+
+        target_idx = None
+        for j, other in enumerate(final_units):
+            if j == idx or j in consumed3:
+                continue
+            if other[0] != "solo":
+                continue
+            if other[1]["target"] is caster:
+                target_idx = j
+                break
+
+        if target_idx is None:
+            consumed3.add(idx)
+            continue
+
+        caster.clashable_guard_used_this_round = True
+        consumed3.add(idx)
+        consumed3.add(target_idx)
+        intercepted_entry = final_units[target_idx][1]
+        intercepted_entry["is_clashable_guard_intercept"] = True
+        entry["is_clashable_guard_intercept"] = True
+        pass3_units.append(("clash", entry, intercepted_entry))
+
+    return pass3_units
 
 
 # Every pre-roll (pre-toss) skill-level timing, in firing order, for a
@@ -1782,19 +1853,31 @@ class BattleCog(commands.GroupCog, name="battle"):
                     "slot": slot_num, "target_slot": action.target_slot, "used": False,
                 })
 
+        def _never_clashes(skill_tags: set[str]) -> bool:
+            return "unclashable" in skill_tags or "guard" in skill_tags
+
         units = []
         for i, entry in enumerate(entries):
             if entry["used"]:
                 continue
             match = None
-            # An Unclashable skill on EITHER side forces this to resolve
-            # unopposed, even if both sides' target/target_slot would
-            # otherwise mutually match.
-            if "unclashable" not in entry["skill"].tags:
+            # An Unclashable OR (plain, non-Clashable) Guard skill on
+            # EITHER side forces this to resolve unopposed, even if both
+            # sides' target/target_slot would otherwise mutually match.
+            # Guard doesn't fight in the traditional sense -- it always
+            # resolves as its own standalone "solo" unit that converts
+            # Final Power into Shield HP for the caster instead of
+            # dealing damage (see the solo branch further down).
+            # Clashable Guard is deliberately NOT excluded here -- if
+            # its own declared target genuinely clashes back, that's
+            # allowed to form a normal 'clash' unit (the clash branch
+            # then special-cases the Clashable Guard reward instead of
+            # normal damage, see there for how).
+            if not _never_clashes(entry["skill"].tags):
                 for other in entries[i + 1:]:
                     if other["used"]:
                         continue
-                    if "unclashable" in other["skill"].tags:
+                    if _never_clashes(other["skill"].tags):
                         continue
                     if (
                         other["caster"] is entry["target"]
@@ -2007,9 +2090,45 @@ class BattleCog(commands.GroupCog, name="battle"):
                 _, clash_lose_post_hit = resolve_triggers(loser_skill, loser_context, "clash_lose")
                 _, turn_end_post_hit_loser = resolve_triggers(loser_skill, loser_context, "turn_end")
 
-                total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
-                    winner_skill, outcome.winner_final_result, loser, winner
-                )
+                # Clashable Guard replaces normal clash damage with its
+                # own reward/mitigation, on EITHER side -- see
+                # GUARD_STAGGER_THRESHOLD_RAISE / GUARD_LOSE_DAMAGE_REDUCTION_PCT
+                # near the top of this function's module for the tuning
+                # knobs. Winning with Clashable Guard deals NO damage at
+                # all -- the reward is raising the loser's Stagger
+                # thresholds (making them easier to Stagger later), not
+                # a hit. Losing WITH a Clashable Guard skill still takes
+                # the winner's damage, just reduced.
+                winner_is_clashable_guard = "clashable_guard" in winner_skill.tags
+                loser_is_clashable_guard = "clashable_guard" in loser_skill.tags
+                guard_note: str | None = None
+
+                if winner_is_clashable_guard:
+                    total_damage, status_log, per_coin_triggers, evade_count = 0, [], [], 0
+                    raised = []
+                    for i in range(3):
+                        if loser.stagger_tiers_enabled[i]:
+                            loser.stagger_thresholds[i] = min(
+                                1.0, loser.stagger_thresholds[i] + GUARD_STAGGER_THRESHOLD_RAISE
+                            )
+                            raised.append(f"Tier {i + 1} -> {round(loser.stagger_thresholds[i] * 100)}%")
+                    if raised:
+                        guard_note = (
+                            f"{status_emoji('guard')} {winner.name}'s Clashable Guard succeeds! "
+                            f"{loser.name}'s Stagger thresholds rise: {', '.join(raised)}"
+                        )
+                else:
+                    total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
+                        winner_skill, outcome.winner_final_result, loser, winner
+                    )
+                    if loser_is_clashable_guard and total_damage > 0:
+                        reduced = round(total_damage * (100 - GUARD_LOSE_DAMAGE_REDUCTION_PCT) / 100)
+                        guard_note = (
+                            f"{status_emoji('guard')} {loser.name}'s Clashable Guard mitigates the "
+                            f"hit: {total_damage} -> {reduced} damage"
+                        )
+                        total_damage = reduced
+
                 loser.take_damage(total_damage)
                 loser.check_stagger(battle.round_number)
                 stagger_post_hit: list[Trigger] = []
@@ -2027,7 +2146,8 @@ class BattleCog(commands.GroupCog, name="battle"):
                 # fire_evade_triggers for why this needs its own call
                 # rather than folding into apply_trigger_effects.
                 trigger_log += fire_evade_triggers(loser, winner, battle, evade_count)
-
+                if guard_note:
+                    trigger_log.append(guard_note)
                 # ---- Animate every attrition round in full ----
                 round_summaries: list[str] = []
                 for round_idx, r in enumerate(outcome.rounds, start=1):
@@ -2117,8 +2237,11 @@ class BattleCog(commands.GroupCog, name="battle"):
                     continue
 
                 is_counter = entry.get("is_counter_retaliation", False)
+                is_guard = "guard" in entry["skill"].tags and not is_counter
                 if is_counter:
                     live_header = f"🔁 **{fighter.name}**'s Counter redirects -> strikes **{target.name}** back!"
+                elif is_guard:
+                    live_header = f"🛡️ **{fighter.name}** raises Guard!"
                 else:
                     live_header = f"🗡️ **{fighter.name}** -> **{target.name}** (unopposed)"
                 await render(live_header)
@@ -2133,7 +2256,10 @@ class BattleCog(commands.GroupCog, name="battle"):
                 # _resolve_pre_roll_chain above. A Counter retaliation
                 # still goes through this same chain, since it's the
                 # defender's own skill resolving normally -- the only
-                # thing special about it is skip_evasion below.
+                # thing special about it is skip_evasion below. Guard
+                # goes through it too -- it's still a skill being used,
+                # its coins still get tossed normally, only what happens
+                # with the RESULT differs (Shield instead of damage).
                 adjusted_skill, pre_roll_post_hit = _resolve_pre_roll_chain(
                     entry["skill"], context, PRE_ROLL_SOLO_TIMINGS
                 )
@@ -2144,50 +2270,89 @@ class BattleCog(commands.GroupCog, name="battle"):
                 sanity_gain = heads_landed * SANITY_PER_HEADS_UNOPPOSED
                 fighter.gain_sanity(sanity_gain)
 
-                total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
-                    adjusted_skill, result, target, fighter, skip_evasion=is_counter
-                )
-                target.take_damage(total_damage)
-                target.check_stagger(battle.round_number)
-                stagger_post_hit: list[Trigger] = []
-                if target.current_stagger_tier > 0:
-                    _, stagger_post_hit = resolve_triggers(adjusted_skill, context, "on_stagger")
-                if is_counter:
-                    _, before_getting_hit_post = resolve_triggers(adjusted_skill, context, "before_getting_hit")
-                    trigger_log = apply_trigger_effects(before_getting_hit_post + stagger_post_hit, fighter, target)
-                else:
+                if is_guard:
+                    # Guard never deals damage -- its Final Power (the
+                    # Power reached after the last coin, same value a
+                    # Clash would compare) becomes Shield HP for the
+                    # CASTER instead. No apply_incoming_hit call at all:
+                    # there's no hit landing on anyone, target is just
+                    # whatever slot the player had to fill in to declare
+                    # it (declare() still requires one), functionally
+                    # vestigial here.
+                    shield_gained = result.final_power
+                    fighter.shield += shield_gained
+                    total_damage = 0
+                    status_log: list[str] = []
+                    evade_count = 0
                     _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
                     _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
                     _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
                     trigger_log = apply_trigger_effects(
-                        pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
-                        + turn_end_post_hit + per_coin_triggers + stagger_post_hit,
+                        pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit + turn_end_post_hit,
                         fighter, target,
                     )
-                    # [On Evade] is the TARGET's own reaction to this
-                    # unopposed attack -- doesn't apply to a Counter
-                    # retaliation, which explicitly bypasses it
-                    # (skip_evasion=True already means evade_count is 0).
-                    trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
+                else:
+                    total_damage, status_log, per_coin_triggers, evade_count = apply_incoming_hit(
+                        adjusted_skill, result, target, fighter, skip_evasion=is_counter
+                    )
+                    target.take_damage(total_damage)
+                    target.check_stagger(battle.round_number)
+                    stagger_post_hit: list[Trigger] = []
+                    if target.current_stagger_tier > 0:
+                        _, stagger_post_hit = resolve_triggers(adjusted_skill, context, "on_stagger")
+                    if is_counter:
+                        _, before_getting_hit_post = resolve_triggers(adjusted_skill, context, "before_getting_hit")
+                        trigger_log = apply_trigger_effects(before_getting_hit_post + stagger_post_hit, fighter, target)
+                    else:
+                        _, unopposed_post_hit = resolve_triggers(adjusted_skill, context, "on_unopposed_attack")
+                        _, attack_end_post_hit = resolve_triggers(adjusted_skill, context, "attack_end")
+                        _, turn_end_post_hit = resolve_triggers(adjusted_skill, context, "turn_end")
+                        trigger_log = apply_trigger_effects(
+                            pre_roll_post_hit + unopposed_post_hit + attack_end_post_hit
+                            + turn_end_post_hit + per_coin_triggers + stagger_post_hit,
+                            fighter, target,
+                        )
+                        # [On Evade] is the TARGET's own reaction to this
+                        # unopposed attack -- doesn't apply to a Counter
+                        # retaliation, which explicitly bypasses it
+                        # (skip_evasion=True already means evade_count is 0).
+                        trigger_log += fire_evade_triggers(target, fighter, battle, evade_count)
 
                 # ---- Animate: no attrition rounds for an unopposed attack, straight to the decisive toss ----
                 final_header = live_header
                 final_face = await animate_faces(final_header, result.coin_results)
-                await animate_damage(final_header, final_face, result.coin_results, status_log)
+                if not is_guard:
+                    await animate_damage(final_header, final_face, result.coin_results, status_log)
                 await asyncio.sleep(0.4)
 
-                field_value = format_skill_result(result)
-                field_value += (
-                    f"\n\n{target.name} takes {total_damage} damage. "
-                    f"({target.name}: {target.hp}/{target.max_hp} HP)"
-                )
-                field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
-                if status_log:
-                    field_value += "\n" + "\n".join(status_log)
-                if trigger_log:
-                    field_value += "\n" + "\n".join(trigger_log)
+                if is_guard:
+                    field_value = format_skill_result(result)
+                    field_value += (
+                        f"\n\n{status_emoji('shield')} {fighter.name} gains {shield_gained} Shield HP. "
+                        f"(Shield: {fighter.shield})"
+                    )
+                    field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
+                    if trigger_log:
+                        field_value += "\n" + "\n".join(trigger_log)
+                else:
+                    field_value = format_skill_result(result)
+                    field_value += (
+                        f"\n\n{target.name} takes {total_damage} damage. "
+                        f"({target.name}: {target.hp}/{target.max_hp} HP)"
+                    )
+                    field_value += f"\n{fighter.name} Sanity +{sanity_gain} ({fighter.sanity})"
+                    if status_log:
+                        field_value += "\n" + "\n".join(status_log)
+                    if trigger_log:
+                        field_value += "\n" + "\n".join(trigger_log)
 
-                if is_counter:
+                if is_guard:
+                    summary_line = (
+                        f"🛡️ **{fighter.name}** raises Guard -- +{shield_gained} Shield "
+                        f"({fighter.shield} total)"
+                    )
+                    full_log_entries.append((f"{fighter.name}'s Guard", field_value))
+                elif is_counter:
                     summary_line = (
                         f"🔁 **{fighter.name}**'s Counter redirects and strikes **{target.name}** back "
                         f"-- {total_damage} damage ({target.name}: {target.hp}/{target.max_hp} HP)"

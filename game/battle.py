@@ -113,6 +113,7 @@ class Fighter:
     # / apply_counter_redirects in cogs/battle.py for how these get set.
     counter_used_this_round: bool = False
     clashable_counter_used_this_round: bool = False
+    clashable_guard_used_this_round: bool = False
 
     # Stagger. stagger_thresholds is 3 HP% values (Tier 1/2/3, in that
     # order -- descending, Tier 1 is the highest/mildest/first crossed).
@@ -128,6 +129,14 @@ class Fighter:
     stagger_tiers_enabled: list[bool] = field(default_factory=lambda: [True, True, True])
     current_stagger_tier: int = 0
     stagger_clears_end_of_round: int | None = None
+
+    # Shield HP from a [Guard] skill: an overhead pool consumed BEFORE
+    # regular HP, not a resistance or a damage-avoidance mechanic --
+    # incoming damage is computed exactly the same way whether or not
+    # Shield exists, take_damage below just drains this first. Clears
+    # every round in clear_declaration (Guard doesn't carry over -- a
+    # fresh Guard each round is the only way to keep it topped up).
+    shield: int = 0
 
     def __post_init__(self):
         if self.speed_min is None:
@@ -198,8 +207,18 @@ class Fighter:
     def is_alive(self) -> bool:
         return self.hp > 0
 
-    def take_damage(self, amount: int):
-        self.hp = max(0, self.hp - amount)
+    def take_damage(self, amount: int) -> tuple[int, int]:
+        """Consumes Shield first (1:1, no reduction of its own -- Shield
+        isn't a resistance, it's a literal overhead HP pool), then
+        spills whatever's left into regular HP. Returns
+        (shield_absorbed, hp_damage) so the caller can log the split if
+        it wants to (see combat() in cogs/battle.py).
+        """
+        shield_absorbed = min(self.shield, amount)
+        self.shield -= shield_absorbed
+        remaining = amount - shield_absorbed
+        self.hp = max(0, self.hp - remaining)
+        return shield_absorbed, remaining
 
     def check_stagger(self, current_round: int) -> int:
         """Checks current HP% against every ENABLED Stagger threshold and
@@ -314,6 +333,8 @@ class Fighter:
         self.declared_actions = {}
         self.counter_used_this_round = False
         self.clashable_counter_used_this_round = False
+        self.clashable_guard_used_this_round = False
+        self.shield = 0
 
     def __str__(self):
         return f"{self.name} (HP {self.hp}/{self.max_hp}, Sanity {self.sanity}, Speed {self.speed})"

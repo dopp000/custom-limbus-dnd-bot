@@ -25,8 +25,8 @@ STATUS_EMOJI_IDS: dict[str, int | None] = {
     # above -- upload the icon and fill in the ID whenever the matching
     # system actually gets built (see README's Roadmap section).
     "shield": 1544679323192266904,   # for Guard's Shield HP, once Guard exists
-    "guard": None,                    # the Guard skill type itself, once it exists
-    "stagger": None,                  # the Stagger status icon itself, once uploaded
+    "guard": 1545222381600243762,
+    "stagger": 1545221789037363252,
     # Panic and Low Morale intentionally share one icon -- same as how
     # they share design (see README) -- rather than needing two uploads.
     "panic": 1544676724862623834,

@@ -100,6 +100,8 @@ SKILL_FLAG_TAGS = {
     "target fixed": "target_fixed",
     "indiscriminate": "indiscriminate",
     "unclashable": "unclashable",
+    "guard": "guard",
+    "clashable guard": "clashable_guard",
 }
 
 # The only statuses a caster can hold on themselves as a self-buff
