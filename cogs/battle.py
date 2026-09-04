@@ -1895,11 +1895,22 @@ class BattleCog(commands.GroupCog, name="battle"):
                 units.append(("solo", entry))
 
         def unit_speed(u):
+            # [Guard] must always resolve before anything else, regardless
+            # of its own slot's Speed -- it's raising a defensive Shield,
+            # not racing to land a hit, and a fast attacker beating a slow
+            # Guard to the punch would mean the Shield never exists in time
+            # to matter. A unit is treated as Guard-priority if EITHER side
+            # carries the tag (a clash unit can only reach this point if
+            # one side is [Clashable Guard], since plain [Unclashable]/
+            # [Guard] already blocks normal pairing -- see the matching
+            # loop above).
             if u[0] == "clash":
                 a_speed = u[1]["caster"].slot_speed(u[1]["slot"])
                 b_speed = u[2]["caster"].slot_speed(u[2]["slot"])
-                return max(a_speed, b_speed)
-            return u[1]["caster"].slot_speed(u[1]["slot"])
+                is_guard_unit = "guard" in u[1]["skill"].tags or "guard" in u[2]["skill"].tags
+                return (1 if is_guard_unit else 0, max(a_speed, b_speed))
+            is_guard_unit = "guard" in u[1]["skill"].tags
+            return (1 if is_guard_unit else 0, u[1]["caster"].slot_speed(u[1]["slot"]))
 
         units.sort(key=unit_speed, reverse=True)
 
