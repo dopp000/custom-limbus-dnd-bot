@@ -102,6 +102,12 @@ SKILL_FLAG_TAGS = {
     "unclashable": "unclashable",
     "guard": "guard",
     "clashable guard": "clashable_guard",
+    # Gates whether /battle declare will accept extra target slots for
+    # this skill (see DeclaredAction.extra_target_slots in
+    # game/battle.py, and the Clash-matching loop in combat(),
+    # cogs/battle.py). A skill without this tag can only ever be aimed
+    # at a single target_slot, same as before this existed.
+    "attack weight": "attack_weight",
 }
 
 # The only statuses a caster can hold on themselves as a self-buff

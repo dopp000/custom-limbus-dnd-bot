@@ -60,6 +60,23 @@ class DeclaredAction:
     slot: int
     target_slot: int
 
+    # Additional target-side slots this same action also "reaches",
+    # beyond the primary target_slot -- only ever populated for a skill
+    # tagged [Attack Weight] (see SKILL_FLAG_TAGS in game/conditions.py).
+    # This is still ONE action with ONE coin toss and ONE damage result
+    # (see apply_incoming_hit / resolve_round_clash, neither of which
+    # loop per reached slot) -- extra_target_slots exists purely so the
+    # Clash-matching loop in combat() (cogs/battle.py) can also pair
+    # this action against a defender declared in any of these slots,
+    # not just target_slot. It does NOT multiply damage: whichever
+    # single reached slot actually forms the real Clash (target_slot
+    # takes priority if eligible, see the matching loop) is the whole
+    # story -- winning that Clash cancels the entire attack, and if
+    # nothing clashes it, it resolves as one ordinary unopposed hit
+    # exactly like a non-Attack-Weight action, since damage already
+    # lands on the target Fighter's whole HP/Shield pool, never per-slot.
+    extra_target_slots: list[int] = field(default_factory=list)
+
 
 @dataclass
 class Fighter:
@@ -296,7 +313,10 @@ class Fighter:
     def get_skill(self, name: str) -> Skill | None:
         return self.skills.get(name.lower())
 
-    def declare_in_slot(self, slot: int, skill: Skill, target: "Fighter", target_slot: int) -> bool:
+    def declare_in_slot(
+        self, slot: int, skill: Skill, target: "Fighter", target_slot: int,
+        extra_target_slots: list[int] | None = None,
+    ) -> bool:
         """Fills (or overwrites/moves) one specific skill slot.
 
         Returns False only if the slot number itself is out of range.
@@ -305,11 +325,17 @@ class Fighter:
         different slot" and "swap which skill is in this slot" both
         work: undeclare the old one (or just overwrite it here) and
         declare_in_slot the new one.
+
+        extra_target_slots is only ever non-empty for an [Attack Weight]
+        skill (validated by the caller, /battle declare in
+        cogs/battle.py, before this is ever called) -- see
+        DeclaredAction.extra_target_slots for what it actually does.
         """
         if not (1 <= slot <= self.skill_slots):
             return False
         self.declared_actions[slot] = DeclaredAction(
-            skill=skill, target=target, slot=slot, target_slot=target_slot
+            skill=skill, target=target, slot=slot, target_slot=target_slot,
+            extra_target_slots=list(extra_target_slots) if extra_target_slots else [],
         )
         return True
 
