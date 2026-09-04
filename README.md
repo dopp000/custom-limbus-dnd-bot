@@ -80,6 +80,27 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
   Build Points aren't built as commands anywhere yet), tier removal is
   just a directly-settable admin/testing flag for now, same as every
   other stat this bot lets you set directly.
+- **Guard / Shield / Clashable Guard**: a third defense-skill type
+  (`[Guard]`/`[Clashable Guard]` flags), alongside Evade/Counter.
+  `[Guard]`: declared normally, but never enters a normal Clash even if
+  mutually targeted (same exclusion as `Unclashable`) -- it always
+  self-resolves, converting its own Final Power into Shield HP for the
+  CASTER instead of dealing damage to anyone. Shield is an overhead HP
+  pool `Fighter.take_damage` drains BEFORE regular HP (1:1, no
+  reduction of its own -- Shield isn't a resistance), and clears every
+  round (`Fighter.clear_declaration`) -- it doesn't persist, a fresh
+  Guard each round is the only way to keep it topped up.
+  `[Clashable Guard]`: reactive, same interception shape as Clashable
+  Counter (own single-use flag, scans the holder's other slots for an
+  unopposed attack to intercept if its own declared action goes
+  unopposed) -- but its clash outcome replaces normal damage entirely,
+  win or lose. Winning deals NO damage: instead it raises the loser's
+  enabled Stagger thresholds by `GUARD_STAGGER_THRESHOLD_RAISE` (10
+  percentage points per tier, easier to tune in `cogs/battle.py`),
+  making them easier to Stagger later rather than an instant Stagger.
+  Losing still takes the winner's damage, just cut by
+  `GUARD_LOSE_DAMAGE_REDUCTION_PCT` (25%). Both constants are
+  placeholder defaults, easy to retune if they feel off in play.
 - **Animated Combat Phase**: `/battle combat` plays out the whole round as one
   continuously-edited message. Coin-by-coin face reveals for every attrition
   round of a Clash, then the winner's final decisive toss gets its own
@@ -171,8 +192,9 @@ Skill-flag tags below.
 
 **Skill-flag tags** (`SKILL_FLAG_TAGS`, own line, never take a `:CoinN:`
 prefix): `Target Fixed`, `Unclashable`, `Indiscriminate`, `Counter`,
-`Clashable Counter`. All five are now enforced -- see Combat Features
-above for `Counter`/`Clashable Counter`, and `declare()`/`combat()` in
+`Clashable Counter`, `Guard`, `Clashable Guard`. All seven are now
+enforced -- see Combat Features above for `Counter`/`Clashable
+Counter`/`Guard`/`Clashable Guard`, and `declare()`/`combat()` in
 `cogs/battle.py` for the other three.
 
 ## Known Gaps (as of the last time I updated this. Might drift, worth checking against the code if it matters)
@@ -256,20 +278,14 @@ genuinely missing:
 
 **Actually on the roadmap, not built yet:**
 
-- **Guard** (a full third defense-skill type alongside Evade/Counter):
-  rolls its own coins, generates Shield HP equal to Final Power, which
-  soaks damage the same as regular HP but sits as a separate overhead
-  pool that clears at the end of the Turn rather than persisting.
-  Nothing resembling Shield exists in the engine yet.
-- **Clashable Guard / Power Guard**: the Guard-family equivalent of
-  Clashable Counter -- reactively clashes against the first incoming
-  attack; winning raises the target's Stagger Threshold, losing reduces
-  the attacker's Final Power (mitigation, not a hit-back). Depends on
-  Guard/Shield existing first.
 - **Offset**: when two Defense skills end up facing each other, both
   are simply cancelled with no effect. Not meaningful until there's a
   real concept of "declaring a defense skill this turn" separate from
-  an attack skill, i.e. depends on Guard existing.
+  an attack skill -- Guard exists now, but nothing enforces "this
+  fighter can only declare ONE defense skill and it takes priority
+  over an attack" the way canon's action economy does, so two Guards
+  facing each other today would each still just self-resolve
+  independently rather than cancel out.
 - **Attack Weight / multi-target Skills**: a single Skill hitting more
   than one enemy slot at once. Everything right now is strictly
   one-attacker-one-target-one-slot.
