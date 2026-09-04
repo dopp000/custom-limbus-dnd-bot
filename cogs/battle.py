@@ -28,6 +28,15 @@ ADMIN_ROLE_ID = 1468446442430533737  # can manage any fighter, not just their ow
 GUARD_STAGGER_THRESHOLD_RAISE = 0.10
 GUARD_LOSE_DAMAGE_REDUCTION_PCT = 25
 
+# Offset: when a Clash forms between two skills that are BOTH tagged as
+# one of these defense-type tags, the Clash cancels outright -- no
+# resolve_round_clash, no damage, no Sanity change, no Triggers on
+# either side -- instead of computing a winner. Deliberately narrow
+# (exactly these four tags, not anything vaguely "defensive"), per
+# design decision: two units both trying to block/redirect the same
+# exchange simply fail to connect with each other, they don't fight.
+DEFENSE_TAGS = {"guard", "clashable_guard", "counter", "clashable_counter"}
+
 # Magnitude (potency * count) thresholds for the status-based half of a
 # fighter's Hint tier, checked highest first. Rupture then gets a flat
 # +1 on top of whatever tier its own magnitude lands on, since its
@@ -324,6 +333,7 @@ class ClashDeclareView(discord.ui.View):
         bot: commands.Bot,
         battle: Battle,
         timeout: float = 60,
+        extra_target_slots: list[int] | None = None,
     ):
         super().__init__(timeout=timeout)
         self.caster = caster
@@ -333,33 +343,29 @@ class ClashDeclareView(discord.ui.View):
         self.target_slot = target_slot
         self.bot = bot
         self.battle = battle
+        self.extra_target_slots = extra_target_slots or []
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.caster.declare_in_slot(self.slot, self.skill, self.target, self.target_slot)
+        self.caster.declare_in_slot(
+            self.slot, self.skill, self.target, self.target_slot, self.extra_target_slots
+        )
 
         for child in self.children:
             child.disabled = True
+        extra_note = (
+            f" (also reaches Slot {', '.join(str(s) for s in self.extra_target_slots)})"
+            if self.extra_target_slots else ""
+        )
         await interaction.response.edit_message(
             content=(
                 f"**Locked in.** {self.caster.name}'s Slot {self.slot} ({self.skill.name}) "
-                f"targets {self.target.name}'s Slot {self.target_slot}."
+                f"targets {self.target.name}'s Slot {self.target_slot}{extra_note}."
             ),
             view=self,
         )
         self.stop()
         await sync_battle_message(self.bot, self.battle)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(content="Cancelled. Nothing was declared.", view=self)
-        self.stop()
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
 
 
 class StealApprovalView(discord.ui.View):
