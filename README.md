@@ -101,6 +101,18 @@ custom ruleset. Owner-operated project, developed in a GitHub Codespace.
   Losing still takes the winner's damage, just cut by
   `GUARD_LOSE_DAMAGE_REDUCTION_PCT` (25%). Both constants are
   placeholder defaults, easy to retune if they feel off in play.
+- **Offset**: when two PLAIN `[Guard]` skills end up mutually targeting
+  each other, both cancel out completely -- no coins tossed, no Shield
+  generated on either side, no triggers fire, just a log line recording
+  it happened. Matches canon's own exception clause exactly: `[Clashable
+  Guard]`, `[Counter]`, and `[Clashable Counter]` are all explicitly
+  EXCLUDED from Offset (verified: Clashable Guard vs Clashable Guard
+  still forms a normal Clash, and a plain Guard vs a Clashable Guard
+  doesn't Offset either -- only plain-vs-plain does). Detected in the
+  same units-matching loop as everything else, checked before the
+  normal Guard "never forms a Clash" exclusion, since Offset is itself
+  a form of mutual matching, just with a full-cancellation outcome
+  instead of Guard's usual "always resolves standalone."
 - **Animated Combat Phase**: `/battle combat` plays out the whole round as one
   continuously-edited message. Coin-by-coin face reveals for every attrition
   round of a Clash, then the winner's final decisive toss gets its own
@@ -278,14 +290,6 @@ genuinely missing:
 
 **Actually on the roadmap, not built yet:**
 
-- **Offset**: when two Defense skills end up facing each other, both
-  are simply cancelled with no effect. Not meaningful until there's a
-  real concept of "declaring a defense skill this turn" separate from
-  an attack skill -- Guard exists now, but nothing enforces "this
-  fighter can only declare ONE defense skill and it takes priority
-  over an attack" the way canon's action economy does, so two Guards
-  facing each other today would each still just self-resolve
-  independently rather than cancel out.
 - **Attack Weight / multi-target Skills**: a single Skill hitting more
   than one enemy slot at once. Everything right now is strictly
   one-attacker-one-target-one-slot.
